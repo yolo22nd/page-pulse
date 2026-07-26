@@ -20,9 +20,16 @@ export function createRateLimiter() {
       prefix: 'audit:ratelimit:',
       sendCommand: async (command: string, ...args: string[]) => {
         const client = getRedisClient() as unknown as Record<string, (...a: unknown[]) => unknown>;
-        const cmdLower = command.toLowerCase();
+        const clientRecord = client as unknown as Record<string, unknown>;
+        const isMock = Boolean(clientRecord.isMock || (clientRecord.constructor && (clientRecord.constructor as { name?: string }).name === 'RedisMock'));
 
-        // 1. ioredis-mock custom fallback for script loading and evalsha execution
+        // 1. For real Redis clients (ioredis), delegate directly to Redis server commands
+        if (typeof client.call === 'function' && !isMock) {
+          return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
+        }
+
+        // 2. ioredis-mock fallback for script loading and evalsha execution
+        const cmdLower = command.toLowerCase();
         if (cmdLower === 'script' && args[0]?.toLowerCase() === 'load') {
           const scriptText = args[1];
           const sha = `sha_${scriptMap.size}_${Math.random()}`;
@@ -38,17 +45,12 @@ export function createRateLimiter() {
           }
         }
 
-        // 2. Real ioredis client execution
-        if (typeof client.call === 'function') {
-          return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
-        }
-
         if (cmdLower === 'eval' && typeof client.eval === 'function') {
           return (await client.eval(...args)) as import('rate-limit-redis').RedisReply;
         }
 
-        if (typeof client[cmdLower] === 'function') {
-          return (await client[cmdLower](...args)) as import('rate-limit-redis').RedisReply;
+        if (typeof client.call === 'function') {
+          return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
         }
 
         throw new Error(`Redis command '${command}' is not supported by current client instance`);
