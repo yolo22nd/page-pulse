@@ -6,24 +6,18 @@ export async function setupTestRedis(): Promise<Redis> {
   const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 
   const testClient = new Redis(redisUrl, {
-    maxRetriesPerRequest: 0,
-    connectTimeout: 400,
+    maxRetriesPerRequest: 2,
+    connectTimeout: 2000,
     lazyConnect: true,
-    enableOfflineQueue: false,
   });
 
   try {
     await testClient.connect();
     await testClient.ping();
     await testClient.flushall();
-    await testClient.quit();
 
-    const realClient = new Redis(redisUrl, {
-      maxRetriesPerRequest: 1,
-      enableOfflineQueue: false,
-    });
-    setRedisClient(realClient);
-    return realClient;
+    setRedisClient(testClient);
+    return testClient;
   } catch {
     try {
       await testClient.quit();

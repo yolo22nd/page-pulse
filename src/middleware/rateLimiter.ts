@@ -20,11 +20,9 @@ export function createRateLimiter() {
       prefix: 'audit:ratelimit:',
       sendCommand: async (command: string, ...args: string[]) => {
         const client = getRedisClient() as unknown as Record<string, (...a: unknown[]) => unknown>;
-        if (typeof client.call === 'function') {
-          return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
-        }
         const cmdLower = command.toLowerCase();
 
+        // 1. ioredis-mock custom fallback for script loading and evalsha execution
         if (cmdLower === 'script' && args[0]?.toLowerCase() === 'load') {
           const scriptText = args[1];
           const sha = `sha_${scriptMap.size}_${Math.random()}`;
@@ -38,6 +36,11 @@ export function createRateLimiter() {
           if (scriptText && typeof client.eval === 'function') {
             return (await client.eval(scriptText, ...args.slice(1))) as import('rate-limit-redis').RedisReply;
           }
+        }
+
+        // 2. Real ioredis client execution
+        if (typeof client.call === 'function') {
+          return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
         }
 
         if (cmdLower === 'eval' && typeof client.eval === 'function') {
