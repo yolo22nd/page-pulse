@@ -5,51 +5,42 @@ import { setRedisClient, getRedisClient } from '../../src/lib/redis';
 export async function setupTestRedis(): Promise<Redis> {
   const client = getRedisClient();
 
-  if (client.status === 'close' || client.status === 'end') {
-    try {
-      await client.connect();
-    } catch {
-      // Ignore
-    }
-  }
-
   if (client.status === 'ready') {
     try {
       await client.flushall();
       return client;
     } catch {
-      // Ignore
+      // Fallback below
     }
   }
 
-  // Wait for client to connect if it's currently connecting
-  if (client.status === 'connecting' || client.status === 'reconnecting') {
-    await new Promise<void>((resolve) => {
-      const timer = setTimeout(() => resolve(), 2000);
-      client.once('ready', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-      client.once('error', () => {
-        clearTimeout(timer);
-        resolve();
-      });
-    });
-
-    if ((client.status as string) === 'ready') {
-      try {
-        await client.flushall();
-        return client;
-      } catch {
-        // Ignore
-      }
+  try {
+    if (client.status === 'close' || client.status === 'end') {
+      await client.connect();
     }
-  }
 
-  // Fallback to ioredis-mock if real Redis is unavailable or fails to connect
-  const mock = new RedisMock();
-  setRedisClient(mock as unknown as Redis);
-  return mock as unknown as Redis;
+    if (client.status !== 'ready') {
+      await new Promise<void>((resolve, reject) => {
+        if (client.status === 'ready') return resolve();
+        const timer = setTimeout(() => reject(new Error('Redis connect timeout')), 3000);
+        client.once('ready', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+        client.once('error', (err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+      });
+    }
+
+    await client.flushall();
+    return client;
+  } catch {
+    const mock = new RedisMock();
+    setRedisClient(mock as unknown as Redis);
+    return mock as unknown as Redis;
+  }
 }
 
 export async function teardownTestRedis(): Promise<void> {
