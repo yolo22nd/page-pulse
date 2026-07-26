@@ -1,13 +1,38 @@
 import Redis from 'ioredis';
 import RedisMock from 'ioredis-mock';
-import { getRedisClient, setRedisClient } from '../../src/lib/redis';
+import { setRedisClient, getRedisClient } from '../../src/lib/redis';
 
 export async function setupTestRedis(): Promise<Redis> {
   const client = getRedisClient();
+
+  if (client.status !== 'ready') {
+    await new Promise<void>((resolve) => {
+      if (client.status === 'ready') return resolve();
+      const onReady = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, 2000);
+
+      function cleanup() {
+        client.off('ready', onReady);
+        client.off('error', onError);
+        clearTimeout(timer);
+      }
+
+      client.once('ready', onReady);
+      client.once('error', onError);
+    });
+  }
+
   try {
-    if (client.status === 'wait' || client.status === 'end') {
-      await client.connect();
-    }
     await client.flushall();
     return client;
   } catch {
