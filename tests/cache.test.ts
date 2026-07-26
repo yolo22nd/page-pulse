@@ -139,6 +139,17 @@ describe('Redis Cache-Aside Caching (POST /api/audit)', () => {
       get: jest.fn().mockRejectedValue(new Error('Redis connection refused')),
       set: jest.fn().mockRejectedValue(new Error('Redis connection refused')),
       ttl: jest.fn().mockRejectedValue(new Error('Redis connection error')),
+      call: jest.fn().mockImplementation((cmd: string) => {
+        const cmdLower = cmd.toLowerCase();
+        if (cmdLower === 'script') {
+          return Promise.resolve('mock_sha_hash');
+        }
+        if (cmdLower === 'eval' || cmdLower === 'evalsha') {
+          return Promise.resolve([1, 60000]);
+        }
+        return Promise.reject(new Error('Redis connection error'));
+      }),
+      eval: jest.fn().mockResolvedValue([1, 60000]),
     };
     setRedisClient(errorRedis as unknown as import('ioredis').default);
 

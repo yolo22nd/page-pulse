@@ -2,12 +2,14 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { AuditRequestSchema } from '../schemas/audit.schema';
 import { runAudit } from '../lib/audit';
 import { concurrencyLimiter } from '../middleware/concurrencyLimiter';
+import { auditRateLimiter } from '../middleware/rateLimiter';
 import { getCachedAudit, setCachedAudit } from '../lib/cache';
 
 const router = Router();
 
 router.post(
   '/api/audit',
+  auditRateLimiter,
   concurrencyLimiter,
   async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -32,7 +34,7 @@ router.post(
         forceRefresh: validatedData.forceRefresh,
       });
 
-      // 3. Cache Write (never cache error responses, only successful 200 audits)
+      // 3. Cache Write (never cache error responses)
       await setCachedAudit(validatedData.url, auditResult);
 
       res.status(200).json({

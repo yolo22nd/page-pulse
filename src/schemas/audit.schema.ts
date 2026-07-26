@@ -95,6 +95,7 @@ export const ApiErrorCodeSchema = z.enum([
   'REDIRECT_LIMIT_EXCEEDED',
   'AUDIT_TIMEOUT',
   'CONCURRENCY_LIMIT_EXCEEDED',
+  'RATE_LIMIT_EXCEEDED',
   'INTERNAL_SERVER_ERROR',
 ]);
 export type ApiErrorCode = z.infer<typeof ApiErrorCodeSchema>;

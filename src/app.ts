@@ -8,6 +8,9 @@ import { errorHandler } from './middleware/errorHandler';
 
 const app: Express = express();
 
+// Trust Render / Cloudflare reverse proxy (1 hop) for accurate client IP rate limiting via X-Forwarded-For
+app.set('trust proxy', 1);
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
