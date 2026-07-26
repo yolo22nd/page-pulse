@@ -14,11 +14,14 @@ router.post(
   async (req: Request, res: Response, next: NextFunction) => {
     try {
       const validatedData = AuditRequestSchema.parse(req.body);
+      const reqRecord = req as unknown as Record<string, unknown>;
+      reqRecord.auditTargetUrl = validatedData.url;
 
       // 1. Cache Read (skipped if forceRefresh is true)
       if (!validatedData.forceRefresh) {
         const cachedResult = await getCachedAudit(validatedData.url);
         if (cachedResult) {
+          reqRecord.cacheHit = true;
           res.status(200).json({
             success: true,
             data: cachedResult,
@@ -26,6 +29,8 @@ router.post(
           return;
         }
       }
+
+      reqRecord.cacheHit = false;
 
       // 2. Fresh Audit Execution
       const auditResult = await runAudit({

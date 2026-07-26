@@ -40,13 +40,14 @@ export function resetActiveAuditsCount(): void {
  *    Zod validation error, upstream fetch failure, hard operation timeout, or client abort).
  */
 export function concurrencyLimiter(
-  _req: Request,
+  req: Request,
   res: Response,
   next: NextFunction,
 ): void {
   const maxConcurrent = parseInt(process.env.MAX_CONCURRENT_AUDITS || '10', 10);
 
   if (activeAuditsCount >= maxConcurrent) {
+    (req as unknown as Record<string, unknown>).rejectionReason = 'CONCURRENCY_LIMIT_EXCEEDED';
     res.status(503).json({
       error: {
         code: 'CONCURRENCY_LIMIT_EXCEEDED',

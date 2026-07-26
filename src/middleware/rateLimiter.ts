@@ -21,7 +21,7 @@ export function createRateLimiter() {
       sendCommand: async (command: string, ...args: string[]) => {
         const client = getRedisClient() as unknown as Record<string, (...a: unknown[]) => unknown>;
         if (typeof client.call === 'function') {
-          return client.call(command, ...args);
+          return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
         }
         const cmdLower = command.toLowerCase();
 
@@ -29,29 +29,30 @@ export function createRateLimiter() {
           const scriptText = args[1];
           const sha = `sha_${scriptMap.size}_${Math.random()}`;
           scriptMap.set(sha, scriptText);
-          return sha;
+          return sha as import('rate-limit-redis').RedisReply;
         }
 
         if (cmdLower === 'evalsha') {
           const sha = args[0];
           const scriptText = scriptMap.get(sha);
           if (scriptText && typeof client.eval === 'function') {
-            return client.eval(scriptText, ...args.slice(1));
+            return (await client.eval(scriptText, ...args.slice(1))) as import('rate-limit-redis').RedisReply;
           }
         }
 
         if (cmdLower === 'eval' && typeof client.eval === 'function') {
-          return client.eval(...args);
+          return (await client.eval(...args)) as import('rate-limit-redis').RedisReply;
         }
 
         if (typeof client[cmdLower] === 'function') {
-          return client[cmdLower](...args);
+          return (await client[cmdLower](...args)) as import('rate-limit-redis').RedisReply;
         }
 
         throw new Error(`Redis command '${command}' is not supported by current client instance`);
       },
     }),
-    handler: (_req, res) => {
+    handler: (req, res) => {
+      (req as unknown as Record<string, unknown>).rejectionReason = 'RATE_LIMIT_EXCEEDED';
       res.status(429).json({
         error: {
           code: 'RATE_LIMIT_EXCEEDED',

@@ -17,9 +17,28 @@ app.use(express.urlencoded({ extended: true }));
 app.use(
   pinoHttp({
     logger,
-    genReqId: (req) => (req.headers['x-request-id'] as string) || randomUUID(),
+    genReqId: (req, res) => {
+      const existingId = (req.headers['x-request-id'] as string) || (req.headers['X-Request-Id'] as string);
+      const reqId = existingId || randomUUID();
+      res.setHeader('x-request-id', reqId);
+      return reqId;
+    },
     customAttributeKeys: {
       reqId: 'requestId',
+    },
+    customProps: (req) => {
+      const customData: Record<string, unknown> = {};
+      const reqRecord = req as unknown as Record<string, unknown>;
+      if (reqRecord.auditTargetUrl) {
+        customData.targetUrl = reqRecord.auditTargetUrl;
+      }
+      if (reqRecord.cacheHit !== undefined) {
+        customData.cacheHit = reqRecord.cacheHit;
+      }
+      if (reqRecord.rejectionReason) {
+        customData.rejectionReason = reqRecord.rejectionReason;
+      }
+      return customData;
     },
   }),
 );
