@@ -5,7 +5,7 @@ let redisInstance: Redis | null = null;
 
 export function getRedisClient(): Redis {
   if (!redisInstance) {
-    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+    const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 
     redisInstance = new Redis(redisUrl, {
       maxRetriesPerRequest: 3,

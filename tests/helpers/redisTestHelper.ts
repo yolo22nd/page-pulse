@@ -3,7 +3,7 @@ import RedisMock from 'ioredis-mock';
 import { setRedisClient, getRedisClient } from '../../src/lib/redis';
 
 export async function setupTestRedis(): Promise<Redis> {
-  const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+  const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
 
   const testClient = new Redis(redisUrl, {
     maxRetriesPerRequest: 0,
