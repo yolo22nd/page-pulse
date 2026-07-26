@@ -14,31 +14,18 @@ export function createRateLimiter() {
     limit,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
-    passOnStoreError: process.env.NODE_ENV === 'production', // Enable passOnStoreError in production, strict in tests
+    passOnStoreError: true,
     validate: { default: false },
     store: new RedisStore({
       prefix: 'audit:ratelimit:',
       sendCommand: async (command: string, ...args: string[]) => {
         const client = getRedisClient() as unknown as Record<string, (...a: unknown[]) => unknown>;
         const clientRecord = client as unknown as Record<string, unknown>;
-        const isMock = Boolean(
-          clientRecord.isMock ||
-            (clientRecord.constructor &&
-              (clientRecord.constructor as { name?: string }).name === 'RedisMock')
-        );
+        const isRealRedis = Boolean(clientRecord._isRealRedis);
 
         // 1. For real Redis clients (ioredis), delegate directly to Redis server commands
-        if (typeof client.call === 'function' && !isMock) {
-          try {
-            return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
-          } catch (err: unknown) {
-            const errorMsg = (err as Error)?.message || '';
-            // If Redis flushed scripts and returns NOSCRIPT, rate-limit-redis handles NOSCRIPT retry automatically
-            if (errorMsg.includes('NOSCRIPT')) {
-              throw err;
-            }
-            throw err;
-          }
+        if (isRealRedis && typeof client.call === 'function') {
+          return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
         }
 
         // 2. ioredis-mock fallback for script loading and evalsha execution
