@@ -1,29 +1,16 @@
 import Redis from 'ioredis';
 import RedisMock from 'ioredis-mock';
-import { setRedisClient, getRedisClient } from '../../src/lib/redis';
+import { getRedisClient, setRedisClient } from '../../src/lib/redis';
 
 export async function setupTestRedis(): Promise<Redis> {
-  const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
-
-  const testClient = new Redis(redisUrl, {
-    maxRetriesPerRequest: 2,
-    connectTimeout: 2000,
-    lazyConnect: true,
-  });
-
+  const client = getRedisClient();
   try {
-    await testClient.connect();
-    await testClient.ping();
-    await testClient.flushall();
-
-    setRedisClient(testClient);
-    return testClient;
-  } catch {
-    try {
-      await testClient.quit();
-    } catch {
-      // Ignore
+    if (client.status === 'wait' || client.status === 'end') {
+      await client.connect();
     }
+    await client.flushall();
+    return client;
+  } catch {
     const mock = new RedisMock();
     setRedisClient(mock as unknown as Redis);
     return mock as unknown as Redis;
