@@ -2,6 +2,9 @@
   "name": "page-pulse",
   "version": "1.0.0",
   "description": "Production-grade URL audit API built with Express and TypeScript",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "main": "dist/server.js",
   "scripts": {
     "build": "rimraf dist && tsc && mkdir -p dist/public && cp src/public/index.html dist/public/",
