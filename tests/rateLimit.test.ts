@@ -1,5 +1,6 @@
 import request from 'supertest';
 import app from '../src/app';
+import { getRedisClient } from '../src/lib/redis';
 import { resetAuditRateLimiter } from '../src/middleware/rateLimiter';
 import { setupTestRedis, teardownTestRedis } from './helpers/redisTestHelper';
 import * as auditEngine from '../src/lib/audit';
@@ -12,6 +13,14 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
   beforeEach(async () => {
     resetAuditRateLimiter();
     await setupTestRedis();
+    try {
+      const redis = getRedisClient();
+      if (redis && typeof redis.flushall === 'function') {
+        await redis.flushall();
+      }
+    } catch {
+      // Ignore
+    }
 
     runAuditSpy = jest.spyOn(auditEngine, 'runAudit').mockImplementation(async (options) => {
       return {
@@ -39,6 +48,14 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
 
   afterEach(async () => {
     runAuditSpy.mockRestore();
+    try {
+      const redis = getRedisClient();
+      if (redis && typeof redis.flushall === 'function') {
+        await redis.flushall();
+      }
+    } catch {
+      // Ignore
+    }
     await teardownTestRedis();
     process.env.RATE_LIMIT_MAX_REQUESTS = originalMax;
     process.env.RATE_LIMIT_WINDOW_MS = originalWindow;
