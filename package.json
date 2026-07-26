@@ -4,7 +4,7 @@
   "description": "Production-grade URL audit API built with Express and TypeScript",
   "main": "dist/server.js",
   "scripts": {
-    "build": "rimraf dist && tsc",
+    "build": "rimraf dist && tsc && mkdir -p dist/public && cp src/public/index.html dist/public/",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
     "test": "jest --passWithNoTests",

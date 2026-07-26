@@ -2,6 +2,7 @@ import express, { Express } from 'express';
 import pinoHttp from 'pino-http';
 import { randomUUID } from 'crypto';
 import { logger } from './lib/logger';
+import landingRouter from './routes/landing';
 import healthRouter from './routes/health';
 import auditRouter from './routes/audit';
 import { errorHandler } from './middleware/errorHandler';
@@ -43,6 +44,7 @@ app.use(
   }),
 );
 
+app.use('/', landingRouter);
 app.use('/', healthRouter);
 app.use('/', auditRouter);
 
