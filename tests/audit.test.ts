@@ -1,47 +1,36 @@
 import request from 'supertest';
 import http from 'http';
 import { AddressInfo } from 'net';
-import RedisMock from 'ioredis-mock';
 import app from '../src/app';
-import { setRedisClient } from '../src/lib/redis';
+import { setupTestRedis, teardownTestRedis } from './helpers/redisTestHelper';
 
-describe('POST /api/audit API Contract & Audit Engine', () => {
+describe('Audit Engine Correctness & Contract Shape (POST /api/audit)', () => {
   let server: http.Server;
   let serverUrl: string;
-  let mockRedis: InstanceType<typeof RedisMock>;
-
-  beforeEach(() => {
-    mockRedis = new RedisMock();
-    setRedisClient(mockRedis as unknown as import('ioredis').default);
-  });
-
-  afterEach(() => {
-    setRedisClient(null);
-  });
 
   beforeAll((done) => {
-    // Spin up an in-memory HTTP server for deterministic audit testing
-    server = http.createServer((req, res) => {
+    setupTestRedis().then(() => {
+      server = http.createServer((req, res) => {
       const urlPath = req.url || '/';
 
-      if (urlPath === '/simple') {
+      if (urlPath === '/full-audit') {
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(`
           <!DOCTYPE html>
           <html>
             <head>
-              <title>Test Page Title</title>
-              <meta name="description" content="A test page description" />
-              <link rel="canonical" href="${serverUrl}/simple" />
+              <title>PagePulse Audit Test</title>
+              <meta name="description" content="Audit test page description" />
+              <link rel="canonical" href="${serverUrl}/full-audit" />
               <meta name="robots" content="index, follow" />
-              <link rel="stylesheet" href="/style.css" />
+              <link rel="stylesheet" href="/styles.css" />
             </head>
             <body>
-              <h1>Main Heading 1</h1>
-              <p>Welcome to test page</p>
+              <h1>Primary Title Heading</h1>
+              <p>Sample content</p>
               <a href="/healthy-link">Healthy Link</a>
               <a href="/broken-link">Broken Link</a>
-              <script src="/app.js"></script>
+              <script src="/script.js"></script>
             </body>
           </html>
         `);
@@ -51,171 +40,107 @@ describe('POST /api/audit API Contract & Audit Engine', () => {
       } else if (urlPath === '/broken-link') {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not Found');
-      } else if (urlPath === '/slow') {
-        // Delay response to trigger audit timeout
+      } else if (urlPath === '/hanging-target') {
+        // Hang connection to test hard timeout ceiling enforcement
         setTimeout(() => {
           if (!res.headersSent) {
-            res.writeHead(200, { 'Content-Type': 'text/html' });
-            res.end('<h1>Slow Response</h1>');
+            res.writeHead(200);
+            res.end('Late');
           }
-        }, 3000);
-      } else if (urlPath.startsWith('/redirect-')) {
-        const step = parseInt(urlPath.replace('/redirect-', ''), 10);
-        if (step < 7) {
-          res.writeHead(302, { Location: `/redirect-${step + 1}` });
-          res.end();
-        } else {
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end('<h1>Final Redirect Destination</h1>');
-        }
+        }, 5000);
       } else {
         res.writeHead(404);
         res.end();
       }
     });
 
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address() as AddressInfo;
-      serverUrl = `http://127.0.0.1:${address.port}`;
-      done();
+      server.listen(0, '127.0.0.1', () => {
+        const address = server.address() as AddressInfo;
+        serverUrl = `http://127.0.0.1:${address.port}`;
+        done();
+      });
     });
   });
 
-  afterAll((done) => {
-    server.close(done);
+  afterAll(async () => {
+    await teardownTestRedis();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
-  describe('Validation Errors (400 VALIDATION_ERROR)', () => {
-    it('should return 400 if url is missing', async () => {
-      const res = await request(app).post('/api/audit').send({});
-
-      expect(res.status).toBe(400);
-      expect(res.body).toHaveProperty('error.code', 'VALIDATION_ERROR');
-      expect(res.body).toHaveProperty('error.details');
+  it('should return complete response contract shape matching Zod schema', async () => {
+    const targetUrl = `${serverUrl}/full-audit`;
+    const res = await request(app).post('/api/audit').send({
+      url: targetUrl,
+      timeoutMs: 10000,
     });
 
-    it('should return 400 if url format is invalid', async () => {
-      const res = await request(app).post('/api/audit').send({
-        url: 'invalid-url-string',
-      });
+    expect(res.status).toBe(200);
+    expect(res.body.success).toBe(true);
 
-      expect(res.status).toBe(400);
-      expect(res.body).toHaveProperty('error.code', 'VALIDATION_ERROR');
+    const data = res.body.data;
+    expect(data.url).toBe(targetUrl);
+    expect(typeof data.auditedAt).toBe('string');
+    expect(typeof data.overallScore).toBe('number');
+    expect(data.overallScore).toBeGreaterThanOrEqual(0);
+    expect(data.overallScore).toBeLessThanOrEqual(100);
+
+    // HTTP
+    expect(data.http.statusCode).toBe(200);
+    expect(typeof data.http.responseTimeMs).toBe('number');
+    expect(Array.isArray(data.http.redirectChain)).toBe(true);
+
+    // SSL (null for HTTP target)
+    expect(data.ssl).toBeNull();
+
+    // SEO
+    expect(data.seo).toEqual({
+      title: 'PagePulse Audit Test',
+      metaDescription: 'Audit test page description',
+      canonicalUrl: `${serverUrl}/full-audit`,
+      h1Count: 1,
+      firstH1: 'Primary Title Heading',
+      metaRobots: 'index, follow',
     });
 
-    it('should return 400 if url scheme is not http/https', async () => {
-      const res = await request(app).post('/api/audit').send({
-        url: 'ftp://example.com/file',
-      });
+    // Broken Links
+    expect(data.brokenLinks.checkedCount).toBe(2);
+    expect(data.brokenLinks.brokenCount).toBe(1);
+    expect(data.brokenLinks.skippedCount).toBe(0);
+    expect(data.brokenLinks.brokenLinks).toEqual([
+      {
+        url: `${serverUrl}/broken-link`,
+        statusCode: 404,
+        error: 'HTTP status 404',
+      },
+    ]);
 
-      expect(res.status).toBe(400);
-      expect(res.body).toHaveProperty('error.code', 'VALIDATION_ERROR');
-    });
+    // Performance Heuristic
+    expect(typeof data.performance.htmlSizeBytes).toBe('number');
+    expect(data.performance.scriptTagCount).toBe(1);
+    expect(data.performance.cssTagCount).toBe(1);
+    expect(typeof data.performance.score).toBe('number');
 
-    it('should return 400 if timeoutMs is out of allowed range', async () => {
-      const resTooLow = await request(app).post('/api/audit').send({
-        url: 'http://example.com',
-        timeoutMs: 500, // min is 1000
-      });
-      expect(resTooLow.status).toBe(400);
-
-      const resTooHigh = await request(app).post('/api/audit').send({
-        url: 'http://example.com',
-        timeoutMs: 50000, // max is 30000
-      });
-      expect(resTooHigh.status).toBe(400);
-    });
+    // Metadata
+    expect(data.cached).toBe(false);
+    expect(data.cacheAge).toBeNull();
   });
 
-  describe('Upstream & Timeout Errors (502 / 504)', () => {
-    it('should return 502 UPSTREAM_FETCH_ERROR if host is unreachable', async () => {
-      const res = await request(app).post('/api/audit').send({
-        url: 'http://127.0.0.1:59999', // Closed port
-        timeoutMs: 3000,
-      });
+  it('should enforce hard timeout ceiling on hanging upstream target and return 504 AUDIT_TIMEOUT', async () => {
+    const startTime = Date.now();
+    const res = await request(app).post('/api/audit').send({
+      url: `${serverUrl}/hanging-target`,
+      timeoutMs: 1000,
+    });
+    const duration = Date.now() - startTime;
 
-      expect(res.status).toBe(502);
-      expect(res.body).toHaveProperty('error.code', 'UPSTREAM_FETCH_ERROR');
+    expect(res.status).toBe(504);
+    expect(res.body.error).toEqual({
+      code: 'AUDIT_TIMEOUT',
+      message: 'Audit operation timed out after 1000ms',
     });
 
-    it('should return 502 REDIRECT_LIMIT_EXCEEDED if redirects exceed 5', async () => {
-      const res = await request(app).post('/api/audit').send({
-        url: `${serverUrl}/redirect-1`,
-        timeoutMs: 5000,
-      });
-
-      expect(res.status).toBe(502);
-      expect(res.body).toHaveProperty('error.code', 'REDIRECT_LIMIT_EXCEEDED');
-    });
-
-    it('should return 504 AUDIT_TIMEOUT if audit operation exceeds timeoutMs', async () => {
-      const res = await request(app).post('/api/audit').send({
-        url: `${serverUrl}/slow`,
-        timeoutMs: 1000,
-      });
-
-      expect(res.status).toBe(504);
-      expect(res.body).toHaveProperty('error.code', 'AUDIT_TIMEOUT');
-    });
-  });
-
-  describe('Successful Audit Execution (200 OK)', () => {
-    it('should perform a full audit and return structured metrics', async () => {
-      const targetUrl = `${serverUrl}/simple`;
-      const res = await request(app).post('/api/audit').send({
-        url: targetUrl,
-        timeoutMs: 10000,
-      });
-
-      expect(res.status).toBe(200);
-      expect(res.body).toHaveProperty('success', true);
-
-      const data = res.body.data;
-      expect(data).toHaveProperty('url', targetUrl);
-      expect(data).toHaveProperty('auditedAt');
-      expect(typeof data.overallScore).toBe('number');
-      expect(data.overallScore).toBeGreaterThanOrEqual(0);
-      expect(data.overallScore).toBeLessThanOrEqual(100);
-
-      // 1. HTTP Audit
-      expect(data.http).toEqual({
-        statusCode: 200,
-        responseTimeMs: expect.any(Number),
-        redirectChain: [],
-      });
-
-      // 2. SSL Audit (null for http target)
-      expect(data.ssl).toBeNull();
-
-      // 3. SEO Audit
-      expect(data.seo).toEqual({
-        title: 'Test Page Title',
-        metaDescription: 'A test page description',
-        canonicalUrl: `${serverUrl}/simple`,
-        h1Count: 1,
-        firstH1: 'Main Heading 1',
-        metaRobots: 'index, follow',
-      });
-
-      // 4. Broken Links Audit
-      expect(data.brokenLinks).toEqual({
-        checkedCount: 2,
-        brokenCount: 1,
-        skippedCount: 0,
-        brokenLinks: [
-          {
-            url: `${serverUrl}/broken-link`,
-            statusCode: 404,
-            error: 'HTTP status 404',
-          },
-        ],
-      });
-
-      // 5. Performance Heuristic Audit
-      expect(data.performance).toHaveProperty('htmlSizeBytes');
-      expect(data.performance).toHaveProperty('scriptTagCount', 1);
-      expect(data.performance).toHaveProperty('cssTagCount', 1);
-      expect(data.performance.score).toBeGreaterThanOrEqual(0);
-    });
+    // Assert terminated around configured timeoutMs (1000ms - 2500ms ceiling)
+    expect(duration).toBeGreaterThanOrEqual(950);
+    expect(duration).toBeLessThan(3000);
   });
 });

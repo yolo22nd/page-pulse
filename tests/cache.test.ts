@@ -1,16 +1,14 @@
 import request from 'supertest';
-import RedisMock from 'ioredis-mock';
 import app from '../src/app';
 import { setRedisClient } from '../src/lib/redis';
+import { setupTestRedis, teardownTestRedis } from './helpers/redisTestHelper';
 import * as auditEngine from '../src/lib/audit';
 
 describe('Redis Cache-Aside Caching (POST /api/audit)', () => {
-  let mockRedis: InstanceType<typeof RedisMock>;
   let runAuditSpy: jest.SpyInstance;
 
-  beforeEach(() => {
-    mockRedis = new RedisMock();
-    setRedisClient(mockRedis as unknown as import('ioredis').default);
+  beforeEach(async () => {
+    await setupTestRedis();
     process.env.AUDIT_CACHE_TTL_SECONDS = '300';
 
     runAuditSpy = jest.spyOn(auditEngine, 'runAudit').mockImplementation(async (options) => {
@@ -51,9 +49,9 @@ describe('Redis Cache-Aside Caching (POST /api/audit)', () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     runAuditSpy.mockRestore();
-    setRedisClient(null);
+    await teardownTestRedis();
   });
 
   it('(1) second identical request within TTL returns cached result and skips audit execution', async () => {
@@ -85,7 +83,7 @@ describe('Redis Cache-Aside Caching (POST /api/audit)', () => {
     expect(runAuditSpy).toHaveBeenCalledTimes(1);
 
     // Clear cache entry to simulate TTL expiration
-    await mockRedis.flushall();
+    await teardownTestRedis();
 
     // 2nd Request after TTL expiry
     const res2 = await request(app).post('/api/audit').send({ url: targetUrl });
@@ -120,7 +118,7 @@ describe('Redis Cache-Aside Caching (POST /api/audit)', () => {
     const rawUrl1 = 'http://EXAMPLE.com/path/?b=2&a=1';
     const rawUrl2 = 'http://example.com/path?a=1&b=2';
 
-    // 1st Request with rawUrl1
+    // 1st Request
     await request(app).post('/api/audit').send({ url: rawUrl1 });
     expect(runAuditSpy).toHaveBeenCalledTimes(1);
 
@@ -134,7 +132,6 @@ describe('Redis Cache-Aside Caching (POST /api/audit)', () => {
   });
 
   it('fails open when Redis operations throw errors', async () => {
-    // Mock Redis throwing errors on GET and SET
     const errorRedis = {
       get: jest.fn().mockRejectedValue(new Error('Redis connection refused')),
       set: jest.fn().mockRejectedValue(new Error('Redis connection refused')),
@@ -154,13 +151,14 @@ describe('Redis Cache-Aside Caching (POST /api/audit)', () => {
     setRedisClient(errorRedis as unknown as import('ioredis').default);
 
     const res = await request(app).post('/api/audit').send({
-      url: 'http://example.com/fail-open',
+      url: 'http://example.com/fail-open-test',
     });
 
-    // Request must still succeed with 200 OK
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
     expect(res.body.data.cached).toBe(false);
     expect(runAuditSpy).toHaveBeenCalledTimes(1);
+
+    setRedisClient(null);
   });
 });

@@ -1,18 +1,14 @@
 import request from 'supertest';
-import RedisMock from 'ioredis-mock';
 import app from '../src/app';
-import { setRedisClient } from '../src/lib/redis';
+import { setupTestRedis, teardownTestRedis } from './helpers/redisTestHelper';
 
 describe('Structured JSON Logging & X-Request-Id Propagation', () => {
-  let mockRedis: InstanceType<typeof RedisMock>;
-
-  beforeEach(() => {
-    mockRedis = new RedisMock();
-    setRedisClient(mockRedis as unknown as import('ioredis').default);
+  beforeEach(async () => {
+    await setupTestRedis();
   });
 
-  afterEach(() => {
-    setRedisClient(null);
+  afterEach(async () => {
+    await teardownTestRedis();
   });
 
   it('should include X-Request-Id response header on health check requests', async () => {

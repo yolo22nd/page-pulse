@@ -1,18 +1,15 @@
 import request from 'supertest';
-import RedisMock from 'ioredis-mock';
 import app from '../src/app';
-import { setRedisClient } from '../src/lib/redis';
+import { setupTestRedis, teardownTestRedis } from './helpers/redisTestHelper';
 import * as auditEngine from '../src/lib/audit';
 
 describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
-  let mockRedis: InstanceType<typeof RedisMock>;
   let runAuditSpy: jest.SpyInstance;
   const originalMax = process.env.RATE_LIMIT_MAX_REQUESTS;
   const originalWindow = process.env.RATE_LIMIT_WINDOW_MS;
 
-  beforeEach(() => {
-    mockRedis = new RedisMock();
-    setRedisClient(mockRedis as unknown as import('ioredis').default);
+  beforeEach(async () => {
+    await setupTestRedis();
 
     runAuditSpy = jest.spyOn(auditEngine, 'runAudit').mockImplementation(async (options) => {
       return {
@@ -38,9 +35,9 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     runAuditSpy.mockRestore();
-    setRedisClient(null);
+    await teardownTestRedis();
     process.env.RATE_LIMIT_MAX_REQUESTS = originalMax;
     process.env.RATE_LIMIT_WINDOW_MS = originalWindow;
   });
