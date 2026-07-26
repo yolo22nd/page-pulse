@@ -159,6 +159,6 @@ describe('Redis Cache-Aside Caching (POST /api/audit)', () => {
     expect(res.body.data.cached).toBe(false);
     expect(runAuditSpy).toHaveBeenCalledTimes(1);
 
-    setRedisClient(null);
+    await setupTestRedis();
   });
 });

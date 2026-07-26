@@ -5,41 +5,51 @@ import { setRedisClient, getRedisClient } from '../../src/lib/redis';
 export async function setupTestRedis(): Promise<Redis> {
   const client = getRedisClient();
 
-  if (client.status !== 'ready') {
+  if (client.status === 'close' || client.status === 'end') {
+    try {
+      await client.connect();
+    } catch {
+      // Ignore
+    }
+  }
+
+  if (client.status === 'ready') {
+    try {
+      await client.flushall();
+      return client;
+    } catch {
+      // Ignore
+    }
+  }
+
+  // Wait for client to connect if it's currently connecting
+  if (client.status === 'connecting' || client.status === 'reconnecting') {
     await new Promise<void>((resolve) => {
-      if (client.status === 'ready') return resolve();
-      const onReady = () => {
-        cleanup();
-        resolve();
-      };
-      const onError = () => {
-        cleanup();
-        resolve();
-      };
-      const timer = setTimeout(() => {
-        cleanup();
-        resolve();
-      }, 2000);
-
-      function cleanup() {
-        client.off('ready', onReady);
-        client.off('error', onError);
+      const timer = setTimeout(() => resolve(), 2000);
+      client.once('ready', () => {
         clearTimeout(timer);
-      }
-
-      client.once('ready', onReady);
-      client.once('error', onError);
+        resolve();
+      });
+      client.once('error', () => {
+        clearTimeout(timer);
+        resolve();
+      });
     });
+
+    if ((client.status as string) === 'ready') {
+      try {
+        await client.flushall();
+        return client;
+      } catch {
+        // Ignore
+      }
+    }
   }
 
-  try {
-    await client.flushall();
-    return client;
-  } catch {
-    const mock = new RedisMock();
-    setRedisClient(mock as unknown as Redis);
-    return mock as unknown as Redis;
-  }
+  // Fallback to ioredis-mock if real Redis is unavailable or fails to connect
+  const mock = new RedisMock();
+  setRedisClient(mock as unknown as Redis);
+  return mock as unknown as Redis;
 }
 
 export async function teardownTestRedis(): Promise<void> {
