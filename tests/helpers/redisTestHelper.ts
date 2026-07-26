@@ -10,37 +10,43 @@ export async function setupTestRedis(): Promise<Redis> {
       await client.flushall();
       return client;
     } catch {
-      // Fallback below
+      // Ignore
     }
   }
 
   try {
     if (client.status === 'close' || client.status === 'end') {
-      await client.connect();
+      await client.connect().catch(() => {});
     }
 
-    if (client.status !== 'ready') {
-      await new Promise<void>((resolve, reject) => {
-        if (client.status === 'ready') return resolve();
-        const timer = setTimeout(() => reject(new Error('Redis connect timeout')), 3000);
-        client.once('ready', () => {
+    if ((client.status as string) !== 'ready') {
+      await new Promise<void>((resolve) => {
+        if ((client.status as string) === 'ready') return resolve();
+        const timer = setTimeout(() => resolve(), 3000);
+        const onReady = () => {
           clearTimeout(timer);
           resolve();
-        });
-        client.once('error', (err) => {
+        };
+        const onError = () => {
           clearTimeout(timer);
-          reject(err);
-        });
+          resolve();
+        };
+        client.once('ready', onReady);
+        client.once('error', onError);
       });
     }
 
-    await client.flushall();
-    return client;
+    if ((client.status as string) === 'ready') {
+      await client.flushall();
+      return client;
+    }
   } catch {
-    const mock = new RedisMock();
-    setRedisClient(mock as unknown as Redis);
-    return mock as unknown as Redis;
+    // Ignore
   }
+
+  const mock = new RedisMock();
+  setRedisClient(mock as unknown as Redis);
+  return mock as unknown as Redis;
 }
 
 export async function teardownTestRedis(): Promise<void> {
