@@ -92,6 +92,7 @@ export const ApiErrorCodeSchema = z.enum([
   'UPSTREAM_FETCH_ERROR',
   'REDIRECT_LIMIT_EXCEEDED',
   'AUDIT_TIMEOUT',
+  'CONCURRENCY_LIMIT_EXCEEDED',
   'INTERNAL_SERVER_ERROR',
 ]);
 export type ApiErrorCode = z.infer<typeof ApiErrorCodeSchema>;
