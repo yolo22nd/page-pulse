@@ -1,5 +1,6 @@
 import request from 'supertest';
 import app from '../src/app';
+import { resetAuditRateLimiter } from '../src/middleware/rateLimiter';
 import { setupTestRedis, teardownTestRedis } from './helpers/redisTestHelper';
 import * as auditEngine from '../src/lib/audit';
 
@@ -9,6 +10,7 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
   const originalWindow = process.env.RATE_LIMIT_WINDOW_MS;
 
   beforeEach(async () => {
+    resetAuditRateLimiter();
     await setupTestRedis();
 
     runAuditSpy = jest.spyOn(auditEngine, 'runAudit').mockImplementation(async (options) => {
@@ -40,11 +42,13 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
     await teardownTestRedis();
     process.env.RATE_LIMIT_MAX_REQUESTS = originalMax;
     process.env.RATE_LIMIT_WINDOW_MS = originalWindow;
+    resetAuditRateLimiter();
   });
 
   it('should enforce rate limit and return 429 when max requests threshold is exceeded', async () => {
     process.env.RATE_LIMIT_MAX_REQUESTS = '3';
     process.env.RATE_LIMIT_WINDOW_MS = '60000';
+    resetAuditRateLimiter();
 
     const clientIp = '203.0.113.195';
 
@@ -76,6 +80,7 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
   it('should reset rate limit quota after window duration expires', async () => {
     process.env.RATE_LIMIT_MAX_REQUESTS = '2';
     process.env.RATE_LIMIT_WINDOW_MS = '1000'; // 1 second short test window
+    resetAuditRateLimiter();
 
     const clientIp = '203.0.113.196';
 
@@ -109,6 +114,7 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
   it('should NOT rate limit GET /health endpoint even if audit limit is reached', async () => {
     process.env.RATE_LIMIT_MAX_REQUESTS = '1';
     process.env.RATE_LIMIT_WINDOW_MS = '60000';
+    resetAuditRateLimiter();
 
     const clientIp = '203.0.113.197';
 
@@ -136,6 +142,7 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
   it('should track rate limits independently per client IP via trust proxy', async () => {
     process.env.RATE_LIMIT_MAX_REQUESTS = '1';
     process.env.RATE_LIMIT_WINDOW_MS = '60000';
+    resetAuditRateLimiter();
 
     const clientA = '198.51.100.1';
     const clientB = '198.51.100.2';

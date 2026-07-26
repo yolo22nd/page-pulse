@@ -8,13 +8,10 @@ export function getRedisClient(): Redis {
     const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
 
     redisInstance = new Redis(redisUrl, {
-      maxRetriesPerRequest: 1,
-      connectTimeout: 1000,
-      commandTimeout: 1000,
-      enableOfflineQueue: false, // Fail fast if Redis is down so API fails open without latency penalty
+      maxRetriesPerRequest: 3,
+      connectTimeout: 5000,
       retryStrategy: (times) => {
-        // Retry connection up to 3 times with exponential backoff, capped at 2 seconds
-        if (times > 3) return null;
+        if (times > 5) return null;
         return Math.min(times * 200, 2000);
       },
     });
@@ -31,9 +28,13 @@ export function getRedisClient(): Redis {
   return redisInstance;
 }
 
-/**
- * Replace active Redis instance (used for mock injection during integration tests).
- */
 export function setRedisClient(client: Redis | null): void {
+  if (redisInstance && redisInstance !== client) {
+    try {
+      redisInstance.disconnect();
+    } catch {
+      // Ignore
+    }
+  }
   redisInstance = client;
 }

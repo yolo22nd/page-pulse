@@ -15,7 +15,7 @@ export function createRateLimiter() {
     standardHeaders: 'draft-7',
     legacyHeaders: false,
     passOnStoreError: true, // Fail open if Redis store is unreachable so rate limiter doesn't crash audit API
-    validate: { default: false }, // Disable inline creation validation checks for test env dynamic overrides
+    validate: { default: false },
     store: new RedisStore({
       prefix: 'audit:ratelimit:',
       sendCommand: async (command: string, ...args: string[]) => {
@@ -63,11 +63,24 @@ export function createRateLimiter() {
   });
 }
 
+let rateLimiterInstance: ReturnType<typeof rateLimit> | null = null;
+
+export function resetAuditRateLimiter(): void {
+  rateLimiterInstance = null;
+}
+
+export function getAuditRateLimiter() {
+  if (!rateLimiterInstance) {
+    rateLimiterInstance = createRateLimiter();
+  }
+  return rateLimiterInstance;
+}
+
 /**
  * Dynamic Rate Limiter Middleware
- * Instantiates rate limiter dynamically so process.env overrides take effect immediately during tests.
+ * Uses cached rate limiter instance, resetting on configuration change if needed.
  */
 export function auditRateLimiter(req: Request, res: Response, next: NextFunction) {
-  const limiter = createRateLimiter();
+  const limiter = getAuditRateLimiter();
   limiter(req, res, next);
 }
