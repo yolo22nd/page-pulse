@@ -78,6 +78,8 @@ export const AuditResultDataSchema = z.object({
   brokenLinks: BrokenLinksAuditSchema,
   performance: PerformanceAuditSchema,
   errors: z.array(z.string()).default([]),
+  cached: z.boolean().default(false),
+  cacheAge: z.number().nullable().default(null),
 });
 export type AuditResultData = z.infer<typeof AuditResultDataSchema>;
 

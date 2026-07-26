@@ -1,11 +1,23 @@
 import request from 'supertest';
 import http from 'http';
 import { AddressInfo } from 'net';
+import RedisMock from 'ioredis-mock';
 import app from '../src/app';
+import { setRedisClient } from '../src/lib/redis';
 
 describe('POST /api/audit API Contract & Audit Engine', () => {
   let server: http.Server;
   let serverUrl: string;
+  let mockRedis: InstanceType<typeof RedisMock>;
+
+  beforeEach(() => {
+    mockRedis = new RedisMock();
+    setRedisClient(mockRedis as unknown as import('ioredis').default);
+  });
+
+  afterEach(() => {
+    setRedisClient(null);
+  });
 
   beforeAll((done) => {
     // Spin up an in-memory HTTP server for deterministic audit testing

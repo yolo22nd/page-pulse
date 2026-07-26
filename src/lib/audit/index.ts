@@ -182,6 +182,8 @@ async function executeAudit(
     brokenLinks: brokenLinksResult,
     performance: performanceResult,
     errors,
+    cached: false,
+    cacheAge: null,
   };
 }
 
