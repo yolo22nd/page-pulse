@@ -14,7 +14,7 @@ export function createRateLimiter() {
     limit,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
-    passOnStoreError: true, // Fail open if Redis store is unreachable so rate limiter doesn't crash audit API
+    passOnStoreError: process.env.NODE_ENV !== 'test', // Fail open in production, throw in test environment for strict validation
     validate: { default: false },
     store: new RedisStore({
       prefix: 'audit:ratelimit:',
