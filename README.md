@@ -55,14 +55,14 @@ Envelope: `{ "success": true, "data": { ... } }`
 | `cached` | `boolean` | `true` if response was served from Redis cache; `false` otherwise |
 | `cacheAge` | `number \| null` | Age of cached result in seconds if `cached: true`; `null` otherwise |
 
-#### 2. Error Response (`400`, `429`, `503`, `504`)
+#### 2. Error Response (`400`, `429`, `502`, `503`, `504`)
 Envelope: `{ "error": { "code": string, "message": string, "details"?: any } }`
 
 | Error Code | HTTP Status | Trigger Condition |
 |---|---|---|
 | `VALIDATION_ERROR` | `400 Bad Request` | Missing `url`, invalid URL format, or `timeoutMs` out of range |
-| `UPSTREAM_FETCH_ERROR` | `400 Bad Request` | Upstream target domain unreachable, DNS failure, or connection refused |
-| `REDIRECT_LIMIT_EXCEEDED` | `400 Bad Request` | Upstream HTTP redirect chain exceeded max 5 redirects ceiling |
+| `UPSTREAM_FETCH_ERROR` | `502 Bad Gateway` | Upstream target domain unreachable, DNS failure, or connection refused |
+| `REDIRECT_LIMIT_EXCEEDED` | `502 Bad Gateway` | Upstream HTTP redirect chain exceeded max 5 redirects ceiling |
 | `AUDIT_TIMEOUT` | `504 Gateway Timeout` | Audit operation exceeded requested `timeoutMs` threshold |
 | `CONCURRENCY_LIMIT_EXCEEDED` | `503 Service Unavailable` | Maximum in-flight audit limit reached (`MAX_CONCURRENT_AUDITS`, default 10) |
 | `RATE_LIMIT_EXCEEDED` | `429 Too Many Requests` | IP rate limit exceeded (`RATE_LIMIT_MAX_REQUESTS` per `RATE_LIMIT_WINDOW_MS`) |
