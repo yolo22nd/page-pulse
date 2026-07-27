@@ -8,6 +8,7 @@ const scriptMap = new Map<string, string>();
 export function createRateLimiter() {
   const windowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS || '60000', 10);
   const limit = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '20', 10);
+  let loadedScriptText: string | null = null;
 
   return rateLimit({
     windowMs,
@@ -40,14 +41,16 @@ export function createRateLimiter() {
 
         // 1. For real Redis clients (ioredis), delegate directly to Redis server commands
         if (typeof client.call === 'function' && !isMock) {
+          if (command.toLowerCase() === 'script' && String(args[0]).toLowerCase() === 'load') {
+            loadedScriptText = String(args[1]);
+          }
           try {
             return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
           } catch (err: unknown) {
-            if (err instanceof Error && err.message.includes('NOSCRIPT') && command.toLowerCase() === 'evalsha') {
-              const scriptText = args[0] as string;
+            if (err instanceof Error && err.message.includes('NOSCRIPT') && command.toLowerCase() === 'evalsha' && loadedScriptText) {
               const keysCount = (args[1] as unknown) as number;
               const remainingArgs = args.slice(2);
-              return (await client.call('eval', scriptText, keysCount, ...remainingArgs)) as import('rate-limit-redis').RedisReply;
+              return (await client.call('eval', loadedScriptText, keysCount, ...remainingArgs)) as import('rate-limit-redis').RedisReply;
             }
             throw err;
           }
