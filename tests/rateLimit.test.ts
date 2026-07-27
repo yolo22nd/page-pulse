@@ -1,8 +1,9 @@
+import RedisMock from 'ioredis-mock';
 import request from 'supertest';
 import app from '../src/app';
-import { getRedisClient } from '../src/lib/redis';
+import { getRedisClient, setRedisClient } from '../src/lib/redis';
 import { resetAuditRateLimiter } from '../src/middleware/rateLimiter';
-import { setupTestRedis, teardownTestRedis } from './helpers/redisTestHelper';
+import { teardownTestRedis } from './helpers/redisTestHelper';
 import * as auditEngine from '../src/lib/audit';
 
 describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
@@ -12,15 +13,10 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
 
   beforeEach(async () => {
     resetAuditRateLimiter();
-    await setupTestRedis();
-    try {
-      const redis = getRedisClient();
-      if (redis && typeof redis.flushall === 'function') {
-        await redis.flushall();
-      }
-    } catch {
-      // Ignore
-    }
+    const mockClient = new RedisMock();
+    setRedisClient(mockClient as unknown as import('ioredis').default);
+
+
 
     runAuditSpy = jest.spyOn(auditEngine, 'runAudit').mockImplementation(async (options) => {
       return {
