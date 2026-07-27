@@ -14,17 +14,32 @@ export function createRateLimiter() {
     limit,
     standardHeaders: 'draft-7',
     legacyHeaders: false,
-    passOnStoreError: true,
+    passOnStoreError: true, // Fail open if Redis store is unreachable so rate limiter doesn't crash audit API
     validate: { default: false },
     store: new RedisStore({
       prefix: 'audit:ratelimit:',
       sendCommand: async (command: string, ...args: string[]) => {
         const client = getRedisClient() as unknown as Record<string, (...a: unknown[]) => unknown>;
         const clientRecord = client as unknown as Record<string, unknown>;
-        const isRealRedis = Boolean(clientRecord._isRealRedis);
+        const isMock = Boolean(clientRecord.isMock || (clientRecord.constructor && (clientRecord.constructor as { name?: string }).name === 'RedisMock'));
+
+        // If client is currently connecting, await ready event before invoking commands
+        if (typeof clientRecord.status === 'string' && clientRecord.status === 'connecting') {
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 1500);
+            (client as unknown as { once: (event: string, fn: () => void) => void }).once('ready', () => {
+              clearTimeout(timer);
+              resolve();
+            });
+            (client as unknown as { once: (event: string, fn: () => void) => void }).once('error', () => {
+              clearTimeout(timer);
+              resolve();
+            });
+          });
+        }
 
         // 1. For real Redis clients (ioredis), delegate directly to Redis server commands
-        if (isRealRedis && typeof client.call === 'function') {
+        if (typeof client.call === 'function' && !isMock) {
           return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
         }
 
