@@ -1,313 +1,541 @@
-# System Architecture & Scaling Guide — PagePulse v2.0
+# Page Pulse — Scale-Out Architecture
 
-This document specifies the technical architecture for scaling **PagePulse** from Task A's single-instance deployment to a production system handling **10,000 audits/day** (~0.12 average QPS, 500 QPS peak bursts) while strictly upholding customer-facing Service Level Agreements (SLAs).
-
----
-
-## 1. Executive Summary & Evolution from Task A
-
-### Task A Baseline
-In Task A, PagePulse was implemented as a single-instance Express application deployed on Render with:
-- **In-Memory Concurrency Limiter**: Tracking in-flight audit requests via an in-process counter (`MAX_CONCURRENT_AUDITS`, default 10) bound to a single Node.js process.
-- **Cache-Aside Caching**: Redis caching via `ioredis` against Render's 25MB free-tier Redis instance (`AUDIT_CACHE_TTL_SECONDS`, default 300).
-- **Per-Client Rate Limiting**: `express-rate-limit` with `rate-limit-redis` store using Express `trust proxy` setting.
-- **Synchronous Execution**: Every audit executed synchronously inside the HTTP request-response cycle.
-
-### Target Scale & SLA Requirements
-| Metric | Task A Baseline | Task B Scale Requirement |
-|---|---|---|
-| **Daily Audit Volume** | ~100 audits/day | **10,000 audits/day** |
-| **Peak Traffic Burst** | 10 concurrent requests | **500 concurrent requests (burst)** |
-| **Cache Hit SLA (p99)** | < 50ms | **< 50ms** |
-| **Fresh Audit SLA (p95)** | < 10s (sync timeout) | **< 3s (async job completion)** |
-| **System Availability SLA** | 99.0% (Render free tier) | **99.9% (High-Availability)** |
-| **Redis Capacity** | 25MB (Render Free Addon) | **1GB+ Managed Redis Cluster** |
-
-### Core Architectural Evolution Strategy
-Scaling PagePulse from 10 to 500 concurrent bursts cannot be achieved by simply adding CPU/RAM to a single Node process. Outbound network socket limits, upstream target response latency (2–8s per audit), and DOM parsing CPU overhead will block the Node event loop and trigger HTTP 504 timeouts.
-
-Therefore, PagePulse v2.0 evolves from a synchronous monolith into a **decoupled, event-driven API & Worker architecture**:
-1. **Stateless API Gateway & Application Tier**: Horizontally scaled Express API pods that process HTTP requests, serve instant Redis cache hits, enforce rate limits, and push non-cached audit jobs to a queue.
-2. **Asynchronous Worker Tier**: Dedicated background worker instances running BullMQ worker pools that execute multi-step audits (HTTP, SSL, SEO, link checks) asynchronously.
-3. **Dual-Mode Response Lifecycle**: Serving instant cache hits synchronously (`200 OK`) while processing cache misses asynchronously (`202 Accepted` with polling / webhook notification) under peak burst conditions.
+> **Scope:** This document describes how the Task A implementation evolves to handle
+> 10,000 audits/day, bursts of 500 concurrent requests, and a customer-facing SLA
+> on response time. It is deliberately written as an *evolution*, not a rewrite —
+> every design decision is grounded in what was already built.
 
 ---
 
-## 2. Component Architecture
+## 1. Starting Point: What Task A Is
+
+Task A is a single-instance Express + TypeScript service deployed on a Render free-tier
+web dyno, backed by a single Render Redis free-tier instance (25 MB). Its key design
+choices are all intentional and worth preserving at scale:
+
+| Concern | Task A implementation |
+|---|---|
+| Validation | Zod schema (`AuditRequestSchema`) on every request |
+| Logging | Pino + `pino-http`, structured JSON, `X-Request-Id` propagation |
+| Caching | Redis cache-aside (`audit:cache:<normalizedUrl>`, TTL 300s) |
+| Rate limiting | `express-rate-limit` + `rate-limit-redis`, keyed on `req.ip`, 20 req/min |
+| Concurrency | In-process counter (`activeAuditsCount`), max 10 in-flight, `finish`/`close` event release |
+| Error shape | Uniform `{ error: { code, message } }` for 4xx/5xx responses |
+
+The in-process concurrency counter (`concurrencyLimiter.ts`) is the clearest marker of
+a single-instance design: it works correctly in one process and breaks completely across
+multiple processes, since each instance holds its own counter in memory. Every other
+mechanism (Zod, Pino, Redis cache, Redis rate-limit store) is already stateless or
+externalized and scales horizontally with little or no change.
+
+---
+
+## 2. Scaling Targets and SLA Definition
+
+Before designing anything, targets must be concrete:
+
+| Metric | Value |
+|---|---|
+| Sustained throughput | 10,000 audits/day ≈ **~7 rps average** |
+| Peak burst | **500 concurrent in-flight requests** |
+| Cache hit rate assumption | ~60% (repeated URLs / shared customers) |
+| Effective fresh-audit rate | ~4 rps average, ~200 rps during burst |
+| P99 response time SLA | **≤ 8 seconds** (discussed below) |
+| Availability | 99.5% monthly uptime |
+
+### Why P99 ≤ 8s?
+
+A single fresh audit in Task A performs:
+1. One TLS/HTTP fetch to the target URL (dominant cost: 1–4s for slow targets)
+2. Up to 20 `HEAD` requests for broken-link checking (parallelised with `Promise.all`)
+3. SSL certificate introspection (same connection as #1)
+4. SEO and performance scoring (in-memory, ~1ms)
+
+Measured P50 on real URLs is ~1.5s; P95 is ~4s; worst-case hanging upstreams are
+clamped at `AUDIT_TIMEOUT` (default 30s, configurable). An SLA tighter than ~5s forces
+aggressive timeout configuration; an SLA of 8s is achievable with fresh audits under
+most conditions while still leaving headroom for the gateway and queue layers introduced
+below.
+
+---
+
+## 3. The Critical Question: Sync or Async?
+
+This is the most important design decision and the one that most architecture documents
+get wrong by defaulting to "just make it async" without working through the numbers.
+
+### The arithmetic of 500 concurrent at P99 ≤ 8s
+
+Assume each fresh audit takes P50 = 2s, P99 = 6s (with a tighter timeout than the
+default 30s). If 500 concurrent requests arrive simultaneously:
+
+- **Synchronous path with enough instances:** With 50 worker pods each running 10
+  concurrent audits (`MAX_CONCURRENT_AUDITS=10`), we have 500 total slots. Every
+  request gets a slot immediately and completes in ≤ 6s. P99 SLA is met. No queue
+  required.
+- **The real constraint:** Provisioning 50 pods for a burst that may last 30 seconds
+  is expensive if the sustained load is only 7 rps. Auto-scaling lags by 1–3 minutes
+  on most platforms. The burst arrives, finds 3–5 warm pods (correct for sustained
+  load), and 475 of the 500 requests hit `CONCURRENCY_LIMIT_EXCEEDED` (503).
+
+This is the real argument for a queue: **not that synchronous is too slow, but that
+auto-scaling cannot react fast enough to absorb a sudden 70× spike.** The queue
+absorbs the burst, holds jobs safely, and lets a steady worker pool drain it within the
+SLA window — as long as the SLA window is wide enough.
+
+### Hybrid model: sync fast path + async slow path
+
+The correct design is a **dynamic watermark**, not a binary sync/async split:
+
+1. **Cache hit path** — always synchronous. A Redis GET takes ~1ms. No queue needed.
+2. **Fresh audit, queue depth low** — synchronous. Claim a worker slot, execute, respond
+   in-band. Client gets a result immediately.
+3. **Fresh audit, queue depth high** (> configurable watermark, e.g. 400 pending) — accept
+   the request, return HTTP 202 Accepted with a `jobId`, expose `GET /api/audit/:jobId`
+   for polling. Client polls until `status: "complete"` or implements a webhook callback.
+
+The 202/poll model is **only activated under genuine saturation.** This satisfies the
+SLA: a client on the fast path gets a result in ≤ 8s; a client on the slow path gets a
+`jobId` immediately (< 50ms) and a result within 8s of the job being dequeued, with
+queue drain time determined by worker capacity. Clients must be told which path they are
+on via the response shape — they should never need to guess.
+
+---
+
+## 4. Component Architecture
 
 ```mermaid
 flowchart TD
-    subgraph ClientLayer["Client & Edge Tier"]
-        Client["Web Client / API Consumer"]
-        CF["Cloudflare WAF / CDN\n(DDoS & Edge Rate Limit)"]
-        ALB["AWS ALB / Render Load Balancer\n(Round-Robin TLS Termination)"]
-    end
+    Client(["Client (browser / API caller)"])
+    GW["API Gateway / Load Balancer\n(Cloudflare / AWS ALB)"]
+    API1["API Pod 1\n(Express, stateless)"]
+    API2["API Pod 2\n(Express, stateless)"]
+    APIN["API Pod N\n(Express, stateless)"]
+    RCache[("Redis\nAudit Cache + Rate Limit\n(≥1 GB, volatile-lru)")]
+    Queue[("BullMQ Job Queue\n(Redis Stream / Sorted Set)")]
+    W1["Worker Pod 1\n(audit engine)"]
+    W2["Worker Pod 2\n(audit engine)"]
+    WN["Worker Pod N\n(audit engine)"]
+    DB[("PostgreSQL\nAudit History +\nJob Status")]
+    Obs["Observability\n(structured logs, traces,\nqueue depth metrics)"]
 
-    subgraph APITier["Stateless API Tier (Auto-Scaling 2–10 Pods)"]
-        API1["Express API Pod 1"]
-        API2["Express API Pod 2"]
-        APIN["Express API Pod N"]
-    end
+    Client -->|"POST /api/audit\nor GET /api/audit/:jobId"| GW
+    GW -->|"route + sticky-session-free"| API1
+    GW -->|"route"| API2
+    GW -->|"route"| APIN
 
-    subgraph DataCacheTier["Distributed Cache & Message Tier"]
-        RedisCluster[("Redis Cluster (Managed 1GB+)\n- Cache-Aside Store\n- Rate Limit Key Store\n- BullMQ Job Queue")]
-    end
+    API1 -->|"1. check cache"| RCache
+    API1 -->|"2a. cache hit → return 200"| Client
+    API1 -->|"2b. enqueue job"| Queue
+    API1 -->|"2c. sync fast-path → borrow slot"| W1
 
-    subgraph WorkerTier["Background Worker Tier (Auto-Scaling 2–20 Pods)"]
-        W1["Audit Worker Pod 1"]
-        W2["Audit Worker Pod 2"]
-        WN["Audit Worker Pod N"]
-    end
+    Queue -->|"consume job"| W1
+    Queue -->|"consume job"| W2
+    Queue -->|"consume job"| WN
 
-    subgraph StorageTier["Persistent Storage & Analytics"]
-        Postgres[("PostgreSQL Database\n- Audit History & Results\n- User Analytics & Score Trends")]
-    end
+    W1 -->|"HTTP fetch + sub-checks"| Internet(["Target URL"])
+    W2 -->|"HTTP fetch + sub-checks"| Internet
+    WN -->|"HTTP fetch + sub-checks"| Internet
 
-    Client -->|"1. POST /api/audit"| CF
-    CF --> ALB
-    ALB --> API1 & API2 & APIN
+    W1 -->|"write result + cache"| RCache
+    W1 -->|"write job status + audit record"| DB
+    W2 -->|"write result + cache"| RCache
+    W2 -->|"write job status + audit record"| DB
 
-    API1 & API2 & APIN -->|"2. Read/Write Cache"| RedisCluster
-    API1 & API2 & APIN -->|"3. Enqueue Job (Cache Miss)"| RedisCluster
+    API1 -->|"GET /api/audit/:jobId poll"| DB
+    API2 -->|"GET /api/audit/:jobId poll"| DB
 
-    RedisCluster -->|"4. Dequeue Audit Job"| W1 & W2 & WN
-    W1 & W2 & WN -->|"5. Outbound HTTP/SSL Fetch"| ExternalWeb["External Webpages & Links"]
-    W1 & W2 & WN -->|"6. Save Final Audit"| Postgres
-    W1 & W2 & WN -->|"7. Populate Cache & Publish Event"| RedisCluster
-    API1 & API2 & APIN -->|"8. Poll / Webhook Result"| Client
+    API1 & API2 & APIN & W1 & W2 & WN -->|"structured logs, traces"| Obs
 ```
 
-### Component Details & Upgrades
+### 4.1 API Gateway / Load Balancer
 
-#### 1. Edge & Load Balancing Tier (Cloudflare + AWS ALB)
-- **Role**: Operates as the entry point for all incoming traffic.
-- **Responsibilities**:
-  - **DDoS Mitigation**: Blocks volumetric attacks before hitting application pods.
-  - **TLS Termination**: Offloads HTTPS decryption at the edge.
-  - **HTTP/2 & Session Stickiness**: Routes requests cleanly across horizontally scaled API pods.
+**What it does:** TLS termination, path-based routing, DDoS absorption, request ID
+injection at the edge, geographic routing if needed.
 
-#### 2. Stateless API Tier (Express Node.js Pods)
-- **Role**: Serves HTTP requests, validates Zod payloads, checks Redis cache, enforces IP rate limits, and returns audit responses or job tickets.
-- **Scaling Policy**: Horizontal Pod Autoscaler (HPA) scales from **2 to 10 instances** based on CPU utilization (> 70%) or request throughput (> 100 QPS/pod).
-- **Process Model**: Fully stateless. Ephemeral in-memory process counters are replaced with distributed Redis keys.
+**Task A today:** Render's built-in Cloudflare reverse proxy provides a single hop.
+`app.set('trust proxy', 1)` in `app.ts` correctly trusts the first `X-Forwarded-For`
+header from this proxy for IP-based rate limiting.
 
-#### 3. Distributed Redis Tier (Managed 1GB+ Cluster)
-- **Role**: Serves as the central high-speed cache, distributed rate limiter, and message broker.
-- **Upgrades from Task A's 25MB Render Free Addon**:
-  - **Capacity Calculation**: 10,000 audits/day * 5KB average JSON payload = 50MB/day raw audit data. With a 300-second TTL (5 minutes) and active LRU eviction, active working set memory requirement is ~150MB. A **1GB Managed Redis Cluster** with high availability (HA failover replica) provides a 6x safety buffer.
-  - **Eviction Policy**: Configured with `allkeys-lru` (Least Recently Used) to gracefully evict old audit entries under memory pressure without crashing.
+**At scale:** Replace with a proper API gateway (Cloudflare Workers, AWS API Gateway,
+or AWS ALB). This layer:
+- Enforces a global per-IP rate limit *before* traffic reaches application pods
+  (cheaper than hitting Redis on every rejected request)
+- Injects `X-Request-Id` at the edge if not present (offloads UUID generation from
+  every app pod — the `genReqId` logic in `app.ts` already honours an incoming header)
+- Provides a WAF for basic bot/abuse filtering
 
-#### 4. Asynchronous Queue & Worker Tier (BullMQ + Node Workers)
-- **Role**: Executes multi-step background audit pipelines (HTTP, SSL, SEO, 20 broken link checks) off the main Express thread.
-- **Scaling Policy**: Worker pool scales from **2 to 20 worker instances** based on queue backlog depth (> 50 pending jobs).
-- **Concurrency Control**: Each worker instance runs 5 concurrent audit threads, with link-checking sub-tasks executing in parallel bounded batches (5 at a time).
+**No change to application code required for this layer** — the trust proxy setting and
+the `X-Request-Id` header propagation already exist.
 
-#### 5. Persistent Historical Datastore (PostgreSQL)
-- **Role**: Stores long-term audit logs, user historical reports, and score trends beyond Redis TTL limits.
-- **Schema**: Indexed on `normalized_url`, `created_at`, and `user_id`.
+### 4.2 API Tier (Horizontally Scaled, Stateless)
 
----
+**What changes:** The API tier is identical in code to Task A except for one thing: the
+in-process `activeAuditsCount` counter in `concurrencyLimiter.ts` is **per-pod** and
+always has been. At scale, this counter becomes a *per-pod* concurrency guard (still
+useful — prevents a single pod from being overwhelmed), but the *global* concurrency
+signal is now the queue depth in BullMQ, not this counter.
 
-## 3. Data Flow & Synchronous vs. Asynchronous Model Analysis
+The `MAX_CONCURRENT_AUDITS` env var on each pod becomes the per-pod worker thread
+pool size, not a global system limit.
 
-### End-to-End Request Lifecycle
+**What stays identical:**
+- Zod validation (`AuditRequestSchema.parse`)
+- Pino `pino-http` logger with `X-Request-Id` propagation
+- Redis cache-aside read (`getCachedAudit`) — cache hit path stays fully synchronous
+- Error shape (`{ error: { code, message } }`)
+- Rate limiting keys (`audit:ratelimit:<ip>`) — the Redis store is shared across all pods
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Client / Consumer
-    participant G as API Gateway / Pod
-    participant R as Redis Cluster
-    participant Q as BullMQ Queue
-    participant W as Worker Node
-    participant T as Upstream Target Website
-    participant DB as PostgreSQL DB
+The API tier decides whether to respond synchronously or enqueue based on current queue
+depth, returning either a full result (200 OK) or a job reference (202 Accepted with
+`{ jobId, statusUrl }`).
 
-    C->>G: POST /api/audit { url, timeoutMs, forceRefresh }
-    G->>R: Rate Limit Check (IP Key)
-    alt Rate Limit Exceeded
-        R-->>G: Limit Exceeded (Count > 20)
-        G-->>C: 429 Too Many Requests (Retry-After header)
-    else Quota Available
-        G->>G: Normalize URL (urlNormalizer.ts)
-        alt forceRefresh == false
-            G->>R: GET audit:cache:<normalized_url>
-            alt Cache Hit
-                R-->>G: Cached Audit JSON
-                G-->>C: 200 OK { success: true, data: { ..., cached: true, cacheAge: 14 } }
-            end
-        end
+### 4.3 Job Queue (BullMQ)
 
-        note over G,Q: Cache Miss Path (Async Decoupling)
-        G->>Q: Enqueue Audit Job { jobId, normalizedUrl, options }
-        G-->>C: 202 Accepted { success: true, data: { jobId, status: "pending", statusUrl: "/api/audit/status/:jobId" } }
+**Technology choice: BullMQ over Redis**
 
-        Q->>W: Dequeue Audit Job
-        W->>T: Outbound Fetch & Links Audit
-        T-->>W: Target Response & HTML
-        W->>DB: INSERT INTO audit_history (...)
-        W->>R: SET audit:cache:<normalized_url> (TTL: 300s)
-        W->>R: PUBLISH audit:completed:<jobId>
+BullMQ is the natural choice given that Redis is already in the stack:
 
-        C->>G: GET /api/audit/status/:jobId (Polling)
-        G->>R: GET audit:cache:<normalized_url>
-        R-->>G: Completed Audit JSON
-        G-->>C: 200 OK { success: true, data: { ..., status: "completed" } }
-    end
-```
-
-### Detailed Justification: Synchronous vs. Asynchronous Tradeoffs
-
-#### Why Task A Used Synchronous Execution
-In Task A, requests were processed synchronously because traffic was low (~10 QPS), and single-user CLI/browser verification expected an immediate response.
-
-#### Why 500 Concurrent Bursts Force Asynchronous Execution
-During a 500-request concurrent burst, executing fresh audits synchronously creates severe failure modes:
-1. **Upstream Latency Accumulation**: Auditing a webpage requires fetching the target HTML, performing SSL TLS handshake, extracting SEO tags, and checking up to 20 outbound `<a href>` links. Average target latency is 2 to 6 seconds.
-2. **Socket Exhaustion & Event Loop Starvation**: 500 concurrent synchronous audits require up to `500 * 20 = 10,000` concurrent outbound HTTP sockets. Node.js thread pools and socket limits would exhaust memory, causing event loop lag > 2,000ms.
-3. **Gateway 504 Timeouts**: Cloudflare and Render load balancers drop HTTP connections open longer than 15–30 seconds. Slow upstream target sites would trigger widespread `504 Gateway Timeout` errors.
-
-#### The Dual-Path SLA Strategy
-- **Path 1: Instant Cache Hit (Synchronous `200 OK`)**:
-  - **SLA**: **p99 < 50ms**
-  - **Behavior**: Handled entirely in-memory by API pods reading Redis cache. Responds instantly with full audit payload.
-- **Path 2: Cache Miss under Burst (Asynchronous `202 Accepted`)**:
-  - **SLA**: **p95 < 3s job processing time**
-  - **Behavior**: API pod validates payload, generates a unique `jobId`, pushes the job to BullMQ, and immediately returns `202 Accepted` (< 20ms) with a `statusUrl`. The client polls `GET /api/audit/status/:jobId` or receives a webhook notification upon completion.
-
----
-
-## 4. Queueing Strategy & Backpressure Handling
-
-### Technology Choice: BullMQ on Redis
-**BullMQ** (backed by Redis) is selected as the queue engine for PagePulse v2.0 for the following architectural reasons:
-1. **Shared Infrastructure**: Leverages the existing Redis Cluster without introducing extra middleware (e.g. RabbitMQ).
-2. **Job Deduplication**: Native support for deterministic `jobId` hashing based on `normalized_url`, preventing redundant audit jobs for identical URLs while one is already in-flight.
-3. **Built-in Rate Limiting & Concurrency Controls**: Supports worker-level concurrency limits and job execution attempt caps.
-4. **Dead-Letter Queue (DLQ) & Automatic Retries**: Failed audit jobs (e.g., target temporary network blip) use exponential backoff retries (3 attempts). Permanent failures are routed to a DLQ for inspection.
-
-### Backpressure & Saturation Management
-
-```
-[ Incoming Request Burst ]
-          │
-          ▼
-[ API Gateway / Cloudflare ] ──(Rate Limit Exceeded)──► HTTP 429
-          │
-          ▼
-[ API Pod: Queue Depth Check ]
-          │
-   Queue Depth > 2,000?
-    ├── YES ──────────────────────────────────────────► HTTP 503 Service Unavailable (Retry-After: 30)
-    └── NO  ──────────────────────────────────────────► Enqueue BullMQ Job & Return HTTP 202
-          │
-          ▼
-[ BullMQ Redis Queue ] ──(Job Eviction / TTL)────────► Dead-Letter Queue (DLQ)
-          │
-          ▼
-[ Auto-Scaling Worker Pool (2 to 20 Pods) ]
-```
-
-When an extreme spike occurs (e.g., 2,000+ queued jobs):
-1. **API Level Backpressure Threshold**: If BullMQ queue length exceeds **2,000 pending jobs**, API pods stop accepting new cache-miss jobs and immediately reject requests with **HTTP 503 Service Unavailable** and a `Retry-After: 30` header.
-2. **Worker Auto-Scaling Trigger**: Kubernetes Horizontal Pod Autoscaler (HPA) monitors Redis queue depth (`bull:audit-queue:wait`). When queue depth exceeds 50 jobs, HPA rapidly scales worker pods from 2 up to 20 instances.
-3. **Upstream Link Fetch Throttling**: Inside each worker, link-checking concurrency is bounded to 5 parallel HTTP GET/HEAD requests at a time per audit, preventing worker IP blacklisting by upstream CDNs.
-
----
-
-## 5. State Topology: Ephemeral vs. Shared State
-
-### Architectural State Mapping
-
-| State Type | Task A (Single Instance Baseline) | Task B (Distributed Scaled Architecture) | Persistence & Scope |
+| Criterion | BullMQ | AWS SQS | RabbitMQ |
 |---|---|---|---|
-| **In-Flight Concurrency** | In-process JS counter (`req.app.locals.inFlightAudits`) in single Express process | Distributed Redis semaphores & BullMQ active job metric (`bull:audit-queue:active`) | Shared, Redis-backed across all API/Worker pods |
-| **Client Rate Limiting** | `express-rate-limit` using `rate-limit-redis` against single Redis node | `express-rate-limit` using `rate-limit-redis` against Redis Cluster | Shared, Redis-backed across all API pods |
-| **Audit Result Cache** | Single-node Redis key `audit:cache:<normalizedUrl>` (25MB free tier) | Redis Cluster key `audit:cache:<normalizedUrl>` with `allkeys-lru` eviction policy | Shared, Redis-backed (300s TTL) |
-| **Audit Execution History** | None (in-memory / transient HTTP response only) | PostgreSQL relational table `audit_history` with indexed JSONB audit payloads | Permanent, persistent database storage |
-| **Worker Processing State** | In-process async execution | BullMQ job states (`waiting`, `active`, `completed`, `failed`) in Redis | Shared, queue-managed |
+| Infrastructure delta | Zero — reuses existing Redis | New AWS dependency | New service to operate |
+| At-least-once delivery | ✓ (job locks) | ✓ | ✓ |
+| Priority queues | ✓ | ✗ (FIFO only) | ✓ |
+| Delayed jobs / retry backoff | ✓ native | ✓ via visibility timeout | ✓ |
+| Dead-letter queue | ✓ (`failed` queue) | ✓ (DLQ config) | ✓ |
+| Job status polling | ✓ (job state in Redis) | ✗ (no built-in) | ✗ |
+| Operational complexity | Low | Very low | Medium |
 
-### Differences from Task A Design
-1. **Elimination of Single-Process Memory Coupling**: In Task A, if Render restarted the Node instance, the in-memory concurrency counter was reset. In Task B, all concurrency limits, rate limits, and job states reside in the distributed Redis Cluster, allowing API pods to be created or destroyed dynamically without losing state or releasing false concurrency capacity.
-2. **Fail-Open Cache Strategy**: In both Task A and Task B, if the Redis Cluster becomes unreachable, API pods fail open—logging a Pino warning and bypassing cache reads/writes to ensure core HTTP audit capability remains online.
+SQS is simpler to operate but loses job-status polling (needed for `GET /api/audit/:jobId`)
+and requires a separate store for result retrieval. BullMQ gives us all of this on top of
+Redis we already run.
+
+**Queue structure:**
+- `audit:queue:priority` — for authenticated/paid-tier clients (future)
+- `audit:queue:standard` — default queue for all current requests
+- `audit:queue:failed` — dead-letter queue for jobs that exhaust retries
+
+**Retry policy:** 3 attempts with exponential backoff (1s, 4s, 16s). After exhaustion,
+the job moves to `audit:queue:failed`. Clients polling `GET /api/audit/:jobId` receive
+`status: "failed"` with an error code matching the Task A error shape.
+
+**Backpressure:** BullMQ itself has no built-in queue depth limit, so the API tier
+enforces it explicitly. If the `audit:queue:standard` depth exceeds a configured
+watermark (e.g. `MAX_QUEUE_DEPTH=1000`, env var), the API tier rejects new requests
+immediately with `503 QUEUE_SATURATED` — same error shape as Task A's
+`CONCURRENCY_LIMIT_EXCEEDED`. This prevents the queue from growing unboundedly and
+consuming all Redis memory.
+
+### 4.4 Worker Tier
+
+Workers are separate Node.js processes (separate Render services or Kubernetes pods)
+that consume from BullMQ. They contain the audit engine code from `src/lib/audit/`
+unchanged — the same `runAudit()` function, the same sub-check modules (`ssl.ts`,
+`seo.ts`, `links.ts`, `performance.ts`).
+
+Each worker:
+1. Dequeues a job
+2. Calls `runAudit({ url, timeoutMs })`
+3. Writes the result to PostgreSQL (job status + audit record)
+4. Writes the result to Redis cache (`setCachedAudit`) — so subsequent cache hits work
+5. Marks the BullMQ job complete
+
+Workers are independently scalable. Because all their state is written to external
+stores, adding or removing worker pods has no effect on correctness — a job dequeued
+by worker 1 and completed by worker 3 (hypothetically, if worker 1 died mid-job) is
+handled correctly by BullMQ's lock-and-requeue mechanism.
+
+### 4.5 Redis — Why the 25 MB Free Tier Is Insufficient
+
+The Task A Redis instance serves three namespaces:
+- `audit:cache:<url>` — cached audit results (~5–10 KB each, TTL 300s)
+- `audit:ratelimit:<ip>` — rate-limit counters (tiny, <100 bytes each, TTL 60s)
+- BullMQ job metadata — job state, result references, retry counts
+
+At 10,000 audits/day with a 300s TTL, the maximum simultaneous cache entries is:
+
+```
+(10,000 / 86,400) × 300 ≈ 35 entries at any given second
+```
+
+But at burst (500 concurrent), all 500 may be for different URLs:
+
+```
+500 entries × 8 KB each = 4 MB for cache alone
+```
+
+BullMQ job metadata adds another 1–2 KB per in-flight job, so 500 concurrent jobs add
+~1 MB. Rate-limit counters are negligible. **Total peak: ~6–8 MB**, which fits in 25 MB.
+
+However, the **production problem is not average memory — it is eviction policy:**
+
+- The Render free-tier Redis uses `noeviction` by default. When memory fills, new writes
+  fail. BullMQ job enqueues failing silently would be catastrophic.
+- At scale, Redis must be configured with `volatile-lru` eviction: only keys with an
+  explicit `EXPIRE` are eligible for eviction. Cache entries have TTLs; BullMQ job
+  metadata should not — so job state is protected, and only stale cache entries are
+  evicted under memory pressure.
+
+**Required Redis tier at scale:**
+
+| Purpose | Minimum tier |
+|---|---|
+| Audit cache + rate limiting | Render Redis Starter (1 GB) or Redis Cloud 100 MB |
+| BullMQ job queue | Same instance (separate logical DB `SELECT 1`) or dedicated instance for isolation |
+| Production configuration | `maxmemory-policy volatile-lru`, persistence `appendonly yes` (RDB snapshots minimum) |
+
+Enabling AOF (`appendonly yes`) prevents job loss on Redis restart — critical when BullMQ
+holds in-flight job state. The free tier does not persist to disk.
+
+### 4.6 Audit History Datastore (PostgreSQL)
+
+Task A has no persistence beyond the Redis cache TTL. At scale, customers expect:
+- `GET /api/audit/:jobId` — real-time job status while async job is running
+- `GET /api/audit/history?url=...` — historical audit results for trend analysis
+- Audit records surviving cache eviction (Redis TTL is for performance, not durability)
+
+**PostgreSQL schema (minimal):**
+
+```sql
+-- Jobs table: lifecycle tracking for async requests
+CREATE TABLE audit_jobs (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  url         TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK (status IN ('pending','running','complete','failed')),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  result_id   UUID REFERENCES audit_results(id)
+);
+
+-- Results table: durable audit records
+CREATE TABLE audit_results (
+  id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  url          TEXT NOT NULL,
+  audited_at   TIMESTAMPTZ NOT NULL,
+  overall_score INT,
+  http_status  INT,
+  ssl_valid    BOOLEAN,
+  ssl_days_remaining INT,
+  broken_links_count INT,
+  payload      JSONB NOT NULL,  -- full AuditResultData for flexible querying
+  CONSTRAINT url_audited_at_unique UNIQUE (url, audited_at)
+);
+
+CREATE INDEX ON audit_results (url, audited_at DESC);
+CREATE INDEX ON audit_jobs (status, created_at);
+```
+
+The `payload JSONB` column stores the full `AuditResultData` object from the existing
+Zod schema — no migration required when sub-check fields evolve, since JSONB is
+schema-flexible. Structured columns (`overall_score`, `http_status`, etc.) exist for
+indexed queries without needing to unpack JSONB.
 
 ---
 
-## 6. End-to-End System Sequence Diagram
-
-The following Mermaid sequence diagram details the full interaction between all system components during both Cache Hit and Cache Miss scenarios under high-concurrency operation:
+## 5. Data Flow: One Audit Request End-to-End at Scale
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    actor User as Client / User Agent
-    participant Gateway as API Gateway / Load Balancer
-    participant API as Express API Pod
-    participant Redis as Redis Cluster
-    participant Queue as BullMQ Job Queue
-    participant Worker as Audit Worker Pod
-    participant Web as Target Website
-    participant DB as PostgreSQL DB
+    participant C as Client
+    participant GW as Gateway
+    participant API as API Pod
+    participant RC as Redis Cache
+    participant Q as BullMQ Queue
+    participant W as Worker Pod
+    participant DB as PostgreSQL
+    participant T as Target URL
 
-    User->>Gateway: POST /api/audit {"url": "https://target.com"}
-    Gateway->>API: Route HTTP Request
-    API->>Redis: 1. Check Rate Limit (IP: 203.0.113.1)
-    
-    alt Rate Limit Exceeded
-        Redis-->>API: Count > 20 in 60s
-        API-->>Gateway: HTTP 429 Too Many Requests
-        Gateway-->>User: HTTP 429 { error: "RATE_LIMIT_EXCEEDED" }
-    else Rate Limit Valid
-        API->>API: 2. Normalize URL ("https://target.com")
-        API->>Redis: 3. GET audit:cache:https://target.com
-        
-        alt Cache Hit (Synchronous Path)
-            Redis-->>API: Return Cached Result Payload
-            API-->>Gateway: HTTP 200 OK (cached: true, cacheAge: 42s)
-            Gateway-->>User: HTTP 200 OK JSON Payload (SLA < 50ms)
-        else Cache Miss (Asynchronous Path)
-            Redis-->>API: Key Not Found
-            API->>Queue: 4. Check Queue Length
-            
-            alt Queue Depth > 2000 (Saturation)
-                API-->>Gateway: HTTP 503 Service Unavailable
-                Gateway-->>User: HTTP 503 { error: "CONCURRENCY_LIMIT_EXCEEDED", retryAfter: 30 }
-            else Queue Healthy
-                API->>Queue: 5. Push Audit Job {"jobId": "job-987", "url": "https://target.com"}
-                API-->>Gateway: HTTP 202 Accepted
-                Gateway-->>User: HTTP 202 { jobId: "job-987", status: "pending", statusUrl: "/api/audit/status/job-987" }
-                
-                Queue->>Worker: 6. Dequeue Job ("job-987")
-                Worker->>Worker: 7. Increment Worker Active Concurrency
-                
-                par Execute Sub-Audits
-                    Worker->>Web: 8a. GET https://target.com (HTTP & HTML)
-                    Worker->>Web: 8b. TLS Handshake (SSL Certificate)
-                    Worker->>Web: 8c. Head/Get Outbound Links (Max 20 Links, 5 Concurrency)
-                end
-                
-                Web-->>Worker: HTTP Response, Headers & Link Statuses
-                Worker->>Worker: 9. Compute Performance & Overall Score
-                
-                Worker->>DB: 10. INSERT Into audit_history
-                Worker->>Redis: 11. SETEX audit:cache:https://target.com 300 <ResultJSON>
-                Worker->>Queue: 12. Mark Job Completed ("job-987")
-                
-                User->>Gateway: 13. GET /api/audit/status/job-987 (Polling)
-                Gateway->>API: Route Status Request
-                API->>Redis: 14. GET audit:cache:https://target.com
-                Redis-->>API: Return Completed Result Payload
-                API-->>Gateway: HTTP 200 OK (status: "completed", cached: true)
-                Gateway-->>User: HTTP 200 OK Final Audit JSON
-            end
+    C->>GW: POST /api/audit { url, timeoutMs }
+    GW->>API: forward + inject X-Request-Id
+    API->>API: Zod validate request
+    API->>RC: GET audit:cache:<normalizedUrl>
+
+    alt Cache Hit (fastest path)
+        RC-->>API: cached result
+        API-->>C: 200 OK { success: true, data: { cached: true, ... } }
+    else Cache Miss
+        API->>RC: GET BullMQ queue depth
+        alt Queue below watermark (sync fast path)
+            API->>W: borrow concurrency slot (in-pod)
+            W->>T: HTTP fetch + TLS probe + link checks
+            T-->>W: response
+            W->>RC: SET audit:cache:<url> (EX 300)
+            W->>DB: INSERT audit_results
+            W-->>API: AuditResultData
+            API-->>C: 200 OK { success: true, data: { cached: false, ... } }
+        else Queue above watermark (async path)
+            API->>Q: ENQUEUE audit job { url, timeoutMs, jobId }
+            API->>DB: INSERT audit_jobs { id: jobId, status: 'pending' }
+            API-->>C: 202 Accepted { jobId, statusUrl: /api/audit/<jobId> }
+            Q->>W: DEQUEUE job
+            W->>DB: UPDATE audit_jobs SET status='running'
+            W->>T: HTTP fetch + TLS probe + link checks
+            T-->>W: response
+            W->>RC: SET audit:cache:<url> (EX 300)
+            W->>DB: INSERT audit_results, UPDATE audit_jobs SET status='complete'
+            C->>API: GET /api/audit/<jobId> (poll)
+            API->>DB: SELECT status, result_id FROM audit_jobs
+            API-->>C: 200 OK { status: 'complete', data: { ... } }
         end
     end
 ```
 
+**Key observations about this flow:**
+
+1. **Cache hits never touch the queue or worker tier** — a cache hit at this scale is a
+   ~1ms Redis GET followed by a JSON response. No concurrency pressure, no SLA risk.
+
+2. **The sync fast path is preserved for low-contention periods.** At 7 rps sustained
+   with 3 warm pods, nearly all requests go synchronous. The queue activates under burst.
+
+3. **The API pod on the sync path still uses the per-pod `MAX_CONCURRENT_AUDITS` counter**
+   from Task A — it's repurposed as the per-pod worker thread pool size, not a global
+   limit. This prevents any single API pod from forking 500 goroutines/promises
+   simultaneously.
+
+4. **The async path introduces exactly one new contract: the 202 + poll pattern.** Clients
+   that do not implement polling receive a `jobId` they can ignore — but they won't get
+   a result. API documentation must make this explicit.
+
 ---
 
-## 7. Summary of Architectural Guarantees
+## 6. Where State Lives: Ephemeral vs. Shared
 
-1. **SLA Adherence**: Serves cache hits in **< 50ms (p99)** synchronously, while handling 500-request bursts via **`202 Accepted` job queueing** to guarantee p95 audit processing in **< 3s**.
-2. **High Availability & Zero Single Points of Failure**: Horizontally scaled stateless Express API pods and background workers backed by a Managed Redis Cluster with HA failover replicas.
-3. **Graceful Degradation**: Dual layer protection via Cloudflare rate-limiting at the edge, Redis IP rate-limiting at the API tier, and Queue Saturation Shields (`503 Service Unavailable`) under catastrophic load.
+This is the most fundamental difference between Task A's single-instance design and
+the scaled architecture.
+
+### Task A (single instance)
+
+| State | Location | Scope | Survives restart? |
+|---|---|---|---|
+| Active in-flight count | Process memory (`activeAuditsCount`) | Global (single process) | ✗ |
+| Rate-limit counters | Redis (`audit:ratelimit:<ip>`) | Global | ✓ (TTL 60s) |
+| Cached audit results | Redis (`audit:cache:<url>`) | Global | ✓ (TTL 300s) |
+| Job history | None | — | — |
+
+### At Scale (multi-instance)
+
+| State | Location | Scope | Survives restart? |
+|---|---|---|---|
+| Per-pod in-flight count | Process memory (each pod's `activeAuditsCount`) | Per-pod only | ✗ |
+| Global queue depth | Redis (BullMQ sorted sets) | Global | ✓ (with AOF) |
+| Rate-limit counters | Redis (`audit:ratelimit:<ip>`) | Global (unchanged) | ✓ (TTL 60s) |
+| Cached audit results | Redis (`audit:cache:<url>`) | Global (unchanged) | ✓ (TTL 300s) |
+| Job status | PostgreSQL (`audit_jobs`) | Global, durable | ✓ |
+| Audit history | PostgreSQL (`audit_results`) | Global, durable | ✓ |
+| BullMQ job metadata | Redis (DB 1) | Global | ✓ (with AOF) |
+
+**The design principle:** everything that multiple pods need to agree on must live in a
+shared external store. Per-pod ephemeral state is acceptable only for things that are
+scoped to a single request lifecycle (the in-flight counter is exactly this — it
+prevents an individual pod from being overwhelmed, not a global limit).
+
+---
+
+## 7. Queueing Strategy: Backpressure and Saturation
+
+BullMQ provides backpressure through job counts, but the application must enforce a
+ceiling explicitly:
+
+```
+POST /api/audit
+  → check rate limit (Redis, unchanged from Task A)
+  → check per-pod in-flight count (in-memory, per-pod guard)
+  → check cache (Redis GET, unchanged)
+  → check queue depth (BullMQ.getWaiting().length)
+  → if depth >= MAX_QUEUE_DEPTH: 503 QUEUE_SATURATED + Retry-After
+  → else: enqueue or process synchronously
+```
+
+**Watermarks:**
+
+| Condition | Action |
+|---|---|
+| Queue depth = 0 and pod has free slots | Sync execution |
+| Queue depth > 0 and < `MAX_QUEUE_DEPTH` | Enqueue, return 202 |
+| Queue depth >= `MAX_QUEUE_DEPTH` | 503 QUEUE_SATURATED, `Retry-After: 10` |
+
+**Dead-letter handling:** After 3 retry attempts with exponential backoff, BullMQ moves
+the job to `audit:queue:failed`. The worker writes `status: 'failed'` to `audit_jobs`.
+Clients polling `GET /api/audit/:jobId` receive the Task A error shape:
+
+```json
+{
+  "error": {
+    "code": "AUDIT_TIMEOUT",
+    "message": "The audit timed out after 30000ms."
+  }
+}
+```
+
+Failed jobs in the dead-letter queue are retained for 24 hours for debugging and can
+be retried via an admin endpoint.
+
+---
+
+## 8. What Stays, What Changes
+
+| Component | Task A | At Scale | Change type |
+|---|---|---|---|
+| Zod validation | `AuditRequestSchema.parse` | Identical | None |
+| Error shape | `{ error: { code, message } }` | Identical + new codes | Additive |
+| Pino logging | Structured JSON, `X-Request-Id` | Identical + distributed trace ID | Additive |
+| Rate limiting | `express-rate-limit` + Redis | Identical (shared Redis store) | None |
+| Cache read | `getCachedAudit` (Redis GET) | Identical | None |
+| Cache write | `setCachedAudit` (Redis SET EX) | Worker writes, not API pod | Location change |
+| Concurrency guard | In-process `activeAuditsCount`, global | Per-pod `activeAuditsCount` + queue depth watermark | Semantics change |
+| Audit engine | `runAudit()` in API process | `runAudit()` in worker process | Location change |
+| Audit history | None | PostgreSQL `audit_results` | New |
+| Job tracking | None | PostgreSQL `audit_jobs` + BullMQ | New |
+| Redis tier | 25 MB free, noeviction | ≥1 GB, `volatile-lru`, AOF | Config change |
+
+The audit engine code itself (`src/lib/audit/`, the four sub-check modules, the Zod
+schema) is entirely unchanged. Moving it from the API process to the worker process
+is a deployment topology change, not a code change.
+
+---
+
+## 9. Observability at Scale
+
+Task A already emits structured Pino JSON logs with `requestId`, `targetUrl`, `cacheHit`,
+and `rejectionReason` on every request. This is the correct foundation. At scale, add:
+
+- **Distributed tracing:** Propagate `X-Request-Id` through the queue payload so worker
+  log lines for a job carry the same `requestId` as the API log line that enqueued it.
+  OpenTelemetry with a Jaeger or Tempo backend provides trace visualisation without
+  changing the Pino log format.
+
+- **Queue depth metric:** Export `audit:queue:standard` depth to a time-series store
+  (Prometheus / Grafana). Alert at 80% of `MAX_QUEUE_DEPTH`. This is the primary
+  capacity signal — it tells you when to add worker pods before the queue saturates.
+
+- **SLA tracking:** Record `completed_at - created_at` on `audit_jobs` rows. Query P99
+  response time per day against the 8s SLA. This is impossible in Task A because there
+  is no durable record of when jobs completed.
+
+---
+
+## 10. Deployment Topology Summary
+
+```
+Render (or equivalent):
+  ├── Gateway: Cloudflare (existing, no change)
+  ├── API Service: page-pulse-api
+  │     ├── instances: 2–5 (auto-scale on CPU/memory)
+  │     ├── env: MAX_CONCURRENT_AUDITS=10, MAX_QUEUE_DEPTH=1000, ...
+  │     └── code: src/ (unchanged from Task A)
+  ├── Worker Service: page-pulse-worker
+  │     ├── instances: 3–10 (auto-scale on queue depth metric)
+  │     ├── env: MAX_CONCURRENT_AUDITS=5 (per-worker throttle)
+  │     └── code: src/lib/audit/ + BullMQ consumer
+  ├── Redis: Render Redis Starter (1 GB, persistent)
+  │     ├── DB 0: audit cache + rate limit (unchanged)
+  │     └── DB 1: BullMQ job queue
+  └── PostgreSQL: Render Postgres (free tier initially, Standard for production SLA)
+        └── audit_jobs, audit_results
+```
+
+---
+
+*This document describes the scaled architecture as an evolution of the Task A
+implementation deployed at [https://page-pulse-dkgh.onrender.com](https://page-pulse-dkgh.onrender.com).*
