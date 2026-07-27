@@ -6,14 +6,18 @@ This document outlines the operational monitoring strategy, predictive SLA alert
 
 ## 1. Observability Architecture & Telemetry Stack
 
-PagePulse emits three primary telemetry streams across all environments:
-1. **Structured JSON Logs**: Emitted by `pino` and `pino-http` to stdout, correlated globally via `X-Request-Id`.
-2. **Prometheus Metrics**: Exposed via `/metrics` endpoint for Prometheus / Datadog scraping.
-3. **Distributed Tracing**: HTTP header context propagation across Gateway $\rightarrow$ API Tier $\rightarrow$ Queue $\rightarrow$ Worker Tier.
+PagePulse's observability stack evolves between Task A and Task B:
+
+- **Currently Live (Task A Baseline)**:
+  1. **Structured JSON Logs**: Emitted by `pino` and `pino-http` to stdout, correlated globally across all requests via `X-Request-Id`.
+  2. **Automated Smoke Testing**: Post-deploy verification executed via `scripts/post-deploy-smoke-test.sh` against the live endpoint.
+- **Proposed Target Architecture (Task B Scale-Up)**:
+  1. **Prometheus Metrics Stream**: Proposed `/metrics` endpoint (using `prom-client` or OpenTelemetry exporter) exposing operational metrics for Prometheus/Datadog scraping.
+  2. **Distributed Tracing**: Context propagation (`traceparent` HTTP headers) across Load Balancer $\rightarrow$ API Gateway $\rightarrow$ BullMQ Queue $\rightarrow$ Worker Tier.
 
 ---
 
-## 2. Telemetry & Core Metrics to Monitor
+## 2. Telemetry & Core Metrics to Monitor (Proposed Task B Metric Specifications)
 
 ### A. Traffic & Request Rate Metrics
 - `http_requests_total{method, route, status}`: Total HTTP request counter grouped by endpoint (`GET /`, `GET /health`, `POST /api/audit`) and status code.

@@ -36,19 +36,20 @@ While acceptable for a non-critical demo, at **10,000 audits/day** with a custom
 
 Task A deployed a single Redis addon instance on Render's **25MB free tier**.
 
-#### Math for 10,000 Audits/Day:
-- Average audit payload JSON size: **~2.5 KB**.
-- Pure payload data volume:
-  $$10,000 \text{ audits/day} \times 2.5 \text{ KB} = 25,000 \text{ KB} \approx 24.4 \text{ MB/day}$$
-- Redis Overhead Factors:
-  - Redis dict key metadata structures: **~0.5 KB per key**.
-  - Sliding-window rate-limiting keys (`audit:ratelimit:*`): **~0.2 KB per active IP window**.
-  - BullMQ job queue state metadata (waiting, active, completed job hashes): **~1.5 KB per queued job**.
+#### Analysis of Data Streams & Accumulation:
+1. **TTL-Bounded Streams (Non-Accumulating)**:
+   - **Audit Cache Payloads**: Bounded by `AUDIT_CACHE_TTL_SECONDS=300` (5 minutes). At 10,000 audits/day with a 30% unique rate during peak hours, active cache entries peak at ~10 entries $\times$ 2.5 KB $\approx$ **25 KB**.
+   - **Rate Limit Counters**: Bounded by 60s window (`RATE_LIMIT_WINDOW_MS=60000`), consuming transient memory of **< 10 KB**.
+2. **Unbounded Accumulator (BullMQ Job Metadata)**:
+   - In Task B's async queueing architecture, every incoming audit creates a persistent BullMQ job hash tracking job status (waiting, active, completed, failed), arguments, and execution logs.
+   - BullMQ job metadata hash size: **~1.5 KB per job**.
+   - Redis key dict & index overhead: **~0.5 KB per key**.
+   - Total overhead per job entry: **~2.0 KB per job**.
 
-#### Total Daily Memory Demand:
-$$\text{Total Daily Memory} \approx 24.4 \text{ MB (payloads)} + 5 \text{ MB (metadata)} + 15 \text{ MB (BullMQ queue state)} = \mathbf{44.4 \text{ MB}}$$
+#### Daily Accumulation & Memory Demand:
+$$\text{Daily Job Metadata Accumulation} = 10,000 \text{ jobs/day} \times 2.0 \text{ KB/job} = 20,000 \text{ KB/day} \approx \mathbf{20 \text{ MB/day}}$$
 
-**Conclusion**: On Task A's 25MB Redis tier, memory will be **100% exhausted within ~12 hours of normal operation**. Without explicit configuration, Redis will return **`OOM command not allowed when used memory > 'maxmemory'`**. Task A's code handles this via fail-open logging (`Redis cache write error`), but caching ceases to function completely, dropping the cache hit ratio to **0%**.
+**Conclusion**: On Task A's 25MB free-tier Redis instance, if BullMQ job pruning (`removeOnComplete`, `removeOnFail`) is unconfigured, job state metadata accumulates at 20 MB/day. Memory will be **100% exhausted within ~30 hours** of continuous operation ($\frac{25 \text{ MB}}{20 \text{ MB/day}} \approx 1.25 \text{ days}$). Without explicit configuration, Redis will return **`OOM command not allowed when used memory > 'maxmemory'`**. Task A's code handles this via fail-open logging (`Redis cache write error`), but caching and queueing fail completely.
 
 ### Observed Symptoms & Metrics
 - **Log Errors**: Pino warning logs emitting `Redis connection refused` or `Redis cache write error (failing open)`.
@@ -96,5 +97,5 @@ Because worker thread pools have finite concurrency (e.g. 10 worker threads per 
 | Failure Mode | Trigger / Cause | Primary Observed Symptom | Technical Mitigation | Residual Risk |
 |---|---|---|---|---|
 | **Cold-Start Latency** | Idle instance spin-down (Render free tier) | `504 Gateway Timeout` & 30–60s P99 latency spikes | 3+ provisioned warm containers + active health pinging | Auto-scaler 15–45s lag during sudden 0-to-500 QPS spikes |
-| **Redis OOM Exhaustion** | 25MB free tier memory saturation at 10k/day | `OOM command not allowed` logs & 0% cache hit ratio | 1GB+ Managed Redis Cluster + `allkeys-lru` eviction + TTL pruning | Cache thrashing under high-cardinality unique URL bursts |
+| **Redis OOM Exhaustion** | 25MB free tier saturation from unpruned BullMQ job state at 10k/day | `OOM command not allowed` logs & 0% cache hit ratio | 1GB+ Managed Redis Cluster + `allkeys-lru` eviction + BullMQ job pruning | Cache thrashing under high-cardinality unique URL bursts |
 | **Worker Starvation** | Slow target websites holding sockets open | Worker pool 100% saturated & queue depth backlog | Per-domain worker caps + hard 8s `AUDIT_TIMEOUT` | Distributed slow targets across 500 distinct domains |

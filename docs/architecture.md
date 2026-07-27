@@ -125,20 +125,27 @@ sequenceDiagram
 ### D. Redis Memory Sizing Math & Eviction Strategy
 
 #### Capacity Calculation for 10,000 Audits/Day
-- Average audit response payload size: **~2.5 KB**.
-- Daily volume: **10,000 audits/day**.
-- Cache TTL: **300 seconds (5 minutes)** (default `AUDIT_CACHE_TTL_SECONDS`).
-- Active concurrent cached entries during peak 1-hour window (assuming 30% unique rate):
-  $$\text{Peak Active Entries} = \frac{10,000 \text{ audits}}{24 \text{ hours}} \times 0.3 \times \left(\frac{300 \text{ sec}}{3600 \text{ sec}}\right) \approx 10 \text{ active entries}$$
-- However, for 24-hour retained caching:
-  $$\text{Daily Storage} = 10,000 \times 2.5 \text{ KB} = 25,000 \text{ KB} \approx 25 \text{ MB}$$
 
-#### Memory Allocation & Eviction Policy
-- **Task A Limits**: Task A ran on Render's 25MB free tier Redis, which saturates quickly under key index overhead, rate-limit counters (`audit:ratelimit:*`), and BullMQ metadata.
+- **Bounded Data Streams (TTL-Protected)**:
+  - **Audit Cache Payloads**: Average payload size ~2.5 KB. With default `AUDIT_CACHE_TTL_SECONDS=300` (5 minutes) and 30% unique rate during peak hours, peak active cache entries are strictly bounded:
+    $$\text{Peak Active Cache Entries} = \frac{10,000 \text{ audits}}{24 \text{ hours}} \times 0.3 \times \left(\frac{300 \text{ sec}}{3600 \text{ sec}}\right) \approx 10 \text{ active entries}$$
+    $$\text{Active Cache Memory} = 10 \times 2.5 \text{ KB} \approx \mathbf{25 \text{ KB}}$$
+  - **Rate-Limiting Counters**: Per-client IP sliding-window keys (`audit:ratelimit:*`) expire after 60 seconds (`RATE_LIMIT_WINDOW_MS=60000`), consuming transient memory of **< 10 KB**.
+
+- **Unbounded Accumulator (BullMQ Job Metadata)**:
+  - In Task B's async queueing design, every audit creates a BullMQ job hash containing request details, timing logs, and status state.
+  - BullMQ job metadata hash size: **~1.5 KB per job**.
+  - Redis key dict & index overhead: **~0.5 KB per entry**.
+  - Total memory per job entry: **~2.0 KB per job**.
+  - Daily accumulation at 10,000 audits/day:
+    $$\text{Daily Job Metadata Accumulation} = 10,000 \text{ jobs/day} \times 2.0 \text{ KB/job} = 20,000 \text{ KB/day} \approx \mathbf{20 \text{ MB/day}}$$
+
+#### Exhaustion Timeline & Task B Sizing Rationale
+- **Task A Free-Tier Limit**: On Render's 25MB free-tier Redis instance, if BullMQ job pruning (`removeOnComplete`, `removeOnFail`) is omitted, job state metadata accumulates at 20 MB/day. Adding transient cache and rate limit data, memory is **100% exhausted within ~30 hours** ($\frac{25 \text{ MB}}{20 \text{ MB/day}} \approx 1.25 \text{ days}$).
 - **Task B Infrastructure**:
   - Redis Cluster Provisioning: **1 GB Managed Redis** (e.g., AWS ElastiCache / Redis Cloud).
   - Eviction Policy: `allkeys-lru` (Least Recently Used).
-  - Rationale: Under sudden traffic spikes, if memory fills, expired or least-recently-accessed audit caches are evicted automatically without throwing OOM errors or crashing rate limit counters.
+  - Mandatory Pruning: Enforce `removeOnComplete: { age: 3600 }` and `removeOnFail: { age: 86400 }` on BullMQ queues so completed jobs are purged after 1 hour.
 
 ### E. Persistent Audit History Datastore
 - **Technology**: PostgreSQL (managed via AWS RDS / Render Postgres).
