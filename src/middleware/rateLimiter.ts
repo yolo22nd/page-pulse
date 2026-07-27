@@ -40,7 +40,24 @@ export function createRateLimiter() {
 
         // 1. For real Redis clients (ioredis), delegate directly to Redis server commands
         if (typeof client.call === 'function' && !isMock) {
-          return (await client.call(command, ...args)) as import('rate-limit-redis').RedisReply;
+          try {
+            const res = await client.call(command, ...args);
+            if (command.toLowerCase() === 'script' && String(args[0]).toLowerCase() === 'load' && typeof res === 'string') {
+              scriptMap.set(res, String(args[1]));
+            }
+            return res as import('rate-limit-redis').RedisReply;
+          } catch (err: unknown) {
+            if (err instanceof Error && err.message.includes('NOSCRIPT') && command.toLowerCase() === 'evalsha') {
+              const sha = String(args[0]);
+              const scriptText = scriptMap.get(sha);
+              if (scriptText) {
+                const keysCount = (args[1] as unknown) as number;
+                const remainingArgs = args.slice(2);
+                return (await client.call('eval', scriptText, keysCount, ...remainingArgs)) as import('rate-limit-redis').RedisReply;
+              }
+            }
+            throw err;
+          }
         }
 
         // 2. ioredis-mock fallback for script loading and evalsha execution

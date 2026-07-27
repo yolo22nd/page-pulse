@@ -1,9 +1,8 @@
-import RedisMock from 'ioredis-mock';
 import request from 'supertest';
 import app from '../src/app';
-import { getRedisClient, setRedisClient } from '../src/lib/redis';
+import { getRedisClient } from '../src/lib/redis';
 import { resetAuditRateLimiter } from '../src/middleware/rateLimiter';
-import { teardownTestRedis } from './helpers/redisTestHelper';
+import { setupTestRedis, teardownTestRedis } from './helpers/redisTestHelper';
 import * as auditEngine from '../src/lib/audit';
 
 describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
@@ -13,10 +12,7 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
 
   beforeEach(async () => {
     resetAuditRateLimiter();
-    const mockClient = new RedisMock();
-    setRedisClient(mockClient as unknown as import('ioredis').default);
-
-
+    await setupTestRedis();
 
     runAuditSpy = jest.spyOn(auditEngine, 'runAudit').mockImplementation(async (options) => {
       return {
@@ -62,6 +58,7 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
     process.env.RATE_LIMIT_MAX_REQUESTS = '3';
     process.env.RATE_LIMIT_WINDOW_MS = '60000';
     resetAuditRateLimiter();
+    await setupTestRedis();
 
     const clientIp = '203.0.113.195';
 
@@ -94,6 +91,7 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
     process.env.RATE_LIMIT_MAX_REQUESTS = '2';
     process.env.RATE_LIMIT_WINDOW_MS = '1000'; // 1 second short test window
     resetAuditRateLimiter();
+    await setupTestRedis();
 
     const clientIp = '203.0.113.196';
 
@@ -128,6 +126,7 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
     process.env.RATE_LIMIT_MAX_REQUESTS = '1';
     process.env.RATE_LIMIT_WINDOW_MS = '60000';
     resetAuditRateLimiter();
+    await setupTestRedis();
 
     const clientIp = '203.0.113.197';
 
@@ -156,6 +155,7 @@ describe('Per-Client IP Rate Limiting (POST /api/audit)', () => {
     process.env.RATE_LIMIT_MAX_REQUESTS = '1';
     process.env.RATE_LIMIT_WINDOW_MS = '60000';
     resetAuditRateLimiter();
+    await setupTestRedis();
 
     const clientA = '198.51.100.1';
     const clientB = '198.51.100.2';
