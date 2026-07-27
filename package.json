@@ -10,7 +10,7 @@
     "build": "node -e \"require('fs').rmSync('dist', {recursive: true, force: true})\" && tsc && node -e \"require('fs').mkdirSync('dist/public', {recursive: true}); require('fs').copyFileSync('src/public/index.html', 'dist/public/index.html')\"",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
-    "test": "jest --passWithNoTests",
+    "test": "jest --runInBand --passWithNoTests",
     "lint": "eslint . --ext .ts"
   },
   "dependencies": {
